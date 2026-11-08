@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    client::{SshHandle, open_session_channel},
+    client::{REQUEST_TIMEOUT, SshHandle, bounded, open_session_channel},
     output::{Progress, ToolError, floor_char_boundary, format_duration, format_size, random_hex},
     paths::resolve_local_path,
 };
@@ -39,7 +39,7 @@ const COPY_CHUNK_BYTES: usize = 1024 * 1024;
 /// How long the server has to answer one SFTP request. With up to 16 requests of 256 KiB in
 /// flight, the library's default of 10 seconds fails transfers on links slower than about
 /// 400 KiB/s.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const SFTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The most entries a folder download lists, so a server whose listing never ends cannot exhaust
 /// this machine's memory.
@@ -51,7 +51,7 @@ fn canceled() -> ToolError {
 
 fn sftp_config() -> Config {
     Config {
-        request_timeout_secs: REQUEST_TIMEOUT.as_secs(),
+        request_timeout_secs: SFTP_REQUEST_TIMEOUT.as_secs(),
         ..Config::default()
     }
 }
@@ -62,10 +62,12 @@ async fn open_sftp_channel(
     cancel: &CancellationToken,
 ) -> Result<russh::ChannelStream<russh::client::Msg>, ToolError> {
     let channel = open_session_channel(handle, cancel).await?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .map_err(|error| ToolError::new(format!("SFTP could not be requested: {error}")))?;
+    bounded(
+        REQUEST_TIMEOUT,
+        "request SFTP",
+        channel.request_subsystem(true, "sftp"),
+    )
+    .await?;
     Ok(channel.into_stream())
 }
 

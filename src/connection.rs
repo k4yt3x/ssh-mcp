@@ -25,7 +25,9 @@ use russh::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    client::{ClientHandler, HandshakeFacts, RemoteForwardTargets, SshHandle},
+    client::{
+        CLOSE_TIMEOUT, ClientHandler, HandshakeFacts, RemoteForwardTargets, SshHandle, best_effort,
+    },
     forward::ForwardTable,
     host_key::{HostKeyPolicy, HostKeyReport, Verdict, Verification},
     output::{ToolError, format_duration, lock, random_hex},
@@ -125,13 +127,13 @@ impl Connection {
     /// End the connection and everything on it.
     async fn close(&self) {
         self.closed.cancel();
-        if let Err(error) = self
-            .handle
-            .disconnect(russh::Disconnect::ByApplication, "", "en")
-            .await
-        {
-            tracing::debug!("disconnecting {} failed: {error}", self.target.describe());
-        }
+        best_effort(
+            CLOSE_TIMEOUT,
+            &format!("disconnecting {}", self.target.describe()),
+            self.handle
+                .disconnect(russh::Disconnect::ByApplication, "", "en"),
+        )
+        .await;
     }
 
     /// The report `connection_status` returns.

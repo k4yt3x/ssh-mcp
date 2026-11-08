@@ -19,7 +19,9 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    client::{SshHandle, open_session_channel},
+    client::{
+        CLOSE_TIMEOUT, REQUEST_TIMEOUT, SshHandle, best_effort, bounded, open_session_channel,
+    },
     output::{
         PROGRESS_INTERVAL, Progress, STATUS_TAIL_BYTES, ToolError, clean_terminal_text,
         format_duration, format_size, last_output_line, lock, random_hex, signal_label,
@@ -1006,8 +1008,10 @@ pub(crate) async fn open(
     let rows = size("rows", request.rows)?;
     let nonce = random_hex(8)?;
     let channel = open_session_channel(handle, cancel).await?;
-    channel
-        .request_pty(
+    bounded(
+        REQUEST_TIMEOUT,
+        "request a terminal",
+        channel.request_pty(
             false,
             "xterm-256color",
             u32::from(request.columns),
@@ -1015,23 +1019,26 @@ pub(crate) async fn open(
             0,
             0,
             &[],
-        )
-        .await
-        .map_err(|error| ToolError::new(format!("The terminal could not be requested: {error}")))?;
+        ),
+    )
+    .await?;
     let program = match &request.command {
         Some(command) => {
-            channel
-                .exec(false, command.as_bytes())
-                .await
-                .map_err(|error| {
-                    ToolError::new(format!("The program could not be started: {error}"))
-                })?;
+            bounded(
+                REQUEST_TIMEOUT,
+                "start the program",
+                channel.exec(false, command.as_bytes()),
+            )
+            .await?;
             first_line(command)
         }
         None => {
-            channel.request_shell(false).await.map_err(|error| {
-                ToolError::new(format!("The shell could not be started: {error}"))
-            })?;
+            bounded(
+                REQUEST_TIMEOUT,
+                "start the shell",
+                channel.request_shell(false),
+            )
+            .await?;
             "login shell".to_owned()
         }
     };
@@ -1178,9 +1185,12 @@ pub(crate) async fn open(
 /// Remove a shell whose opening failed from `table` and close it.
 async fn abandon(table: &Mutex<ShellTable>, shell: &Shell) {
     lock(table).shells.remove(&shell.number);
-    if let Err(error) = shell.writer.close().await {
-        tracing::debug!("closing the abandoned shell failed: {error}");
-    }
+    best_effort(
+        CLOSE_TIMEOUT,
+        "closing the abandoned shell",
+        shell.writer.close(),
+    )
+    .await;
 }
 
 /// Forget a shell whose exit the result being returned has reported.
@@ -1443,9 +1453,7 @@ pub(crate) async fn close(table: &Mutex<ShellTable>, number: u32) -> Result<Stri
         .remove(&number)
         .ok_or_else(|| ToolError::new(format!("This connection has no shell {number}.")))?;
     let (bytes, dropped, remaining) = shell.lock().buffer.take(UNREQUESTED_OUTPUT_BYTES);
-    if let Err(error) = shell.writer.close().await {
-        tracing::debug!("closing shell {number} failed: {error}");
-    }
+    best_effort(CLOSE_TIMEOUT, "closing the shell", shell.writer.close()).await;
     let mut text = format!("[shell {number}: closed]");
     if dropped > 0 {
         text.push_str(&format!(

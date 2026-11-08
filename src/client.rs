@@ -22,26 +22,60 @@ use crate::{
 /// An authenticated or authenticating SSH session.
 pub(crate) type SshHandle = client::Handle<ClientHandler>;
 
-/// How long the server has to answer a request to open a channel. russh itself waits forever.
-const CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a request to the server may take: to be sent, and to be answered when it waits for an
+/// answer. russh queues a request behind the connection's outgoing data and waits for answers
+/// without limit, so a server or network that stops would otherwise hold a call forever.
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long closing something may take before it is given up on. Closing is best effort, and the
+/// idle cleanup closes connections one after another, so it must not wait long.
+pub(crate) const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Await `request` for at most `limit`, describing a failure as being unable to `action`, such as
+/// "start the shell".
+pub(crate) async fn bounded<T>(
+    limit: Duration,
+    action: &str,
+    request: impl Future<Output = Result<T, russh::Error>>,
+) -> Result<T, ToolError> {
+    match tokio::time::timeout(limit, request).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(ToolError::new(format!("Could not {action}: {error}"))),
+        Err(_) => Err(ToolError::new(format!(
+            "Could not {action}: the server did not respond within {}.",
+            format_duration(limit)
+        ))),
+    }
+}
+
+/// Await `request`, whose failure needs only logging (closing something, say), for at most
+/// `limit`. Returns whether it completed.
+pub(crate) async fn best_effort(
+    limit: Duration,
+    action: &str,
+    request: impl Future<Output = Result<(), russh::Error>>,
+) -> bool {
+    match tokio::time::timeout(limit, request).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::debug!("{action} failed: {error}");
+            false
+        }
+        Err(_) => {
+            tracing::debug!("{action} got no response within {}", format_duration(limit));
+            false
+        }
+    }
+}
 
 /// Open a session channel for a command, a shell or SFTP, giving up when the server does not
-/// answer within [`CHANNEL_OPEN_TIMEOUT`] or `cancel` fires.
+/// answer within [`REQUEST_TIMEOUT`] or `cancel` fires.
 pub(crate) async fn open_session_channel(
     handle: &SshHandle,
     cancel: &CancellationToken,
 ) -> Result<Channel<Msg>, ToolError> {
     tokio::select! {
-        opened = tokio::time::timeout(CHANNEL_OPEN_TIMEOUT, handle.channel_open_session()) => match opened {
-            Ok(Ok(channel)) => Ok(channel),
-            Ok(Err(error)) => Err(ToolError::new(format!(
-                "The server refused to open a channel: {error}"
-            ))),
-            Err(_) => Err(ToolError::new(format!(
-                "The server did not answer a request to open a channel within {}; it may be overloaded or have stopped responding.",
-                format_duration(CHANNEL_OPEN_TIMEOUT)
-            ))),
-        },
+        opened = bounded(REQUEST_TIMEOUT, "open a channel", handle.channel_open_session()) => opened,
         () = cancel.cancelled() => Err(ToolError::new("The call was canceled before the server opened a channel.")),
     }
 }
@@ -188,9 +222,12 @@ impl client::Handler for ClientHandler {
                         target.host,
                         target.port
                     );
-                    if let Err(error) = channel.close().await {
-                        tracing::debug!("closing the forwarded channel failed: {error}");
-                    }
+                    best_effort(
+                        CLOSE_TIMEOUT,
+                        "closing the forwarded channel",
+                        channel.close(),
+                    )
+                    .await;
                 }
             }
         });

@@ -8,7 +8,9 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    client::{SshHandle, open_session_channel},
+    client::{
+        CLOSE_TIMEOUT, REQUEST_TIMEOUT, SshHandle, best_effort, bounded, open_session_channel,
+    },
     output::{
         PROGRESS_INTERVAL, Progress, ToolError, decode_with_limit, format_duration, format_size,
         last_output_line, signal_label,
@@ -59,10 +61,12 @@ pub(crate) async fn run(
     progress: &mut Progress,
 ) -> Result<String, ToolError> {
     let mut channel = open_session_channel(handle, cancel).await?;
-    channel
-        .exec(true, request.command.as_bytes())
-        .await
-        .map_err(|error| ToolError::new(format!("The command could not be sent: {error}")))?;
+    bounded(
+        REQUEST_TIMEOUT,
+        "send the command",
+        channel.exec(true, request.command.as_bytes()),
+    )
+    .await?;
 
     let started = Instant::now();
     // stdin is fed by its own task: a command that does not read it, or prints while it is fed,
@@ -89,6 +93,7 @@ pub(crate) async fn run(
     let mut exec_confirmed = false;
     let mut drain_until = None;
     let mut left_output_open = false;
+    let mut unresponsive = false;
     let mut progress_tick = tokio::time::interval(PROGRESS_INTERVAL);
     progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -126,28 +131,36 @@ pub(crate) async fn run(
             },
             () = tokio::time::sleep_until(drain_until.unwrap_or(next_step)), if drain_until.is_some() => {
                 left_output_open = true;
-                if let Err(error) = channel.close().await {
-                    tracing::debug!("closing the exec channel failed: {error}");
-                }
+                best_effort(CLOSE_TIMEOUT, "closing the exec channel", channel.close()).await;
                 break;
             }
             () = tokio::time::sleep_until(next_step) => {
                 if stop.is_none() {
                     stop = Some(StopReason::TimedOut);
                 }
+                // Each step waits at most STOP_GRACE to be sent, so a server that stopped reading
+                // the connection cannot keep the call from returning.
                 match steps_taken {
-                    0 => {
-                        send_signal(&channel, Sig::TERM).await;
-                        signals_sent.push("TERM");
-                    }
-                    1 => {
-                        send_signal(&channel, Sig::KILL).await;
-                        signals_sent.push("KILL");
+                    0 | 1 => {
+                        let (signal, name) = if steps_taken == 0 {
+                            (Sig::TERM, "TERM")
+                        } else {
+                            (Sig::KILL, "KILL")
+                        };
+                        let sent = best_effort(
+                            STOP_GRACE,
+                            "sending a signal to the command",
+                            channel.signal(signal),
+                        )
+                        .await;
+                        if sent {
+                            signals_sent.push(name);
+                        } else {
+                            unresponsive = true;
+                        }
                     }
                     2 => {
-                        if let Err(error) = channel.close().await {
-                            tracing::debug!("closing the exec channel failed: {error}");
-                        }
+                        best_effort(STOP_GRACE, "closing the exec channel", channel.close()).await;
                     }
                     _ => break,
                 }
@@ -176,6 +189,7 @@ pub(crate) async fn run(
             stop,
             signals_sent,
             left_output_open,
+            unresponsive,
         },
         &stdout,
         &stderr,
@@ -190,6 +204,8 @@ struct Ending {
     signals_sent: Vec<&'static str>,
     /// The command exited, but something it started kept its output open past [`EXIT_DRAIN`].
     left_output_open: bool,
+    /// A signal could not be sent: the server stopped taking requests.
+    unresponsive: bool,
 }
 
 /// Add `data` to `stream` without letting both streams together pass [`MAX_CAPTURE_BYTES`].
@@ -200,12 +216,6 @@ fn capture(stream: &mut Vec<u8>, other_stream_bytes: usize, data: &[u8]) -> bool
     data.len() >= room
 }
 
-async fn send_signal(channel: &russh::Channel<russh::client::Msg>, signal: Sig) {
-    if let Err(error) = channel.signal(signal).await {
-        tracing::debug!("sending a signal to the command failed: {error}");
-    }
-}
-
 fn describe(request: &ExecRequest, ending: &Ending, stdout: &[u8], stderr: &[u8]) -> String {
     let Ending {
         elapsed,
@@ -213,6 +223,7 @@ fn describe(request: &ExecRequest, ending: &Ending, stdout: &[u8], stderr: &[u8]
         stop,
         signals_sent,
         left_output_open,
+        unresponsive,
     } = ending;
     let outcome = match exit {
         Some(Exit::Status(code)) => format!("exit code {code}"),
@@ -230,25 +241,31 @@ fn describe(request: &ExecRequest, ending: &Ending, stdout: &[u8], stderr: &[u8]
             signals_sent.join(", then ")
         )
     };
-    let left_open = if *left_output_open {
-        "; something it started still holds its output open, so output after its exit is missing"
-    } else {
-        ""
-    };
+    let mut notes = String::new();
+    if *left_output_open {
+        notes.push_str(
+            "; something it started still holds its output open, so output after its exit is missing",
+        );
+    }
+    if *unresponsive {
+        notes.push_str(
+            "; the server stopped taking the stop signals, so the command may still be running",
+        );
+    }
     let headline = match stop {
-        None => format!("[{outcome} after {}{left_open}]", format_duration(*elapsed)),
+        None => format!("[{outcome} after {}{notes}]", format_duration(*elapsed)),
         Some(StopReason::TimedOut) => format!(
-            "[timed out after {}{stopped_with}; {outcome}{left_open}]",
+            "[timed out after {}{stopped_with}; {outcome}{notes}]",
             format_duration(request.timeout)
         ),
         Some(StopReason::Canceled) => {
             format!(
-                "[canceled after {}{stopped_with}; {outcome}{left_open}]",
+                "[canceled after {}{stopped_with}; {outcome}{notes}]",
                 format_duration(*elapsed)
             )
         }
         Some(StopReason::OutputLimit) => format!(
-            "[stopped after printing {}{stopped_with}; {outcome}{left_open}]",
+            "[stopped after printing {}{stopped_with}; {outcome}{notes}]",
             format_size(MAX_CAPTURE_BYTES as u64)
         ),
     };

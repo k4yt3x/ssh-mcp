@@ -86,9 +86,18 @@ impl TestServer {
             methods,
             auth_rejection_time: Duration::from_millis(1),
             auth_rejection_time_initial: Some(Duration::ZERO),
+            // With a window this large and a small receive buffer below, a command that does not
+            // read its input stalls the whole connection, as russh does once the input fills its
+            // buffers. The tools must still return when that happens.
+            window_size: 64 * 1024 * 1024,
             ..server::Config::default()
         });
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket.set_recv_buffer_size(64 * 1024).expect("buffer size");
+        socket
+            .bind("127.0.0.1:0".parse().expect("address"))
+            .expect("bind");
+        let listener = socket.listen(16).expect("listen");
         let port = listener.local_addr().expect("address").port();
         let logins = Arc::new(logins);
         tokio::spawn(async move {

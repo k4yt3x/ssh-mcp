@@ -18,7 +18,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    client::{RemoteForwardTarget, RemoteForwardTargets, SshHandle},
+    client::{
+        CLOSE_TIMEOUT, REQUEST_TIMEOUT, RemoteForwardTarget, RemoteForwardTargets, SshHandle,
+        best_effort, bounded,
+    },
     output::{ToolError, lock},
 };
 
@@ -181,14 +184,12 @@ pub(crate) async fn open_remote(
     local_host: String,
     local_port: u16,
 ) -> Result<String, ToolError> {
-    let granted = handle
-        .tcpip_forward(remote_bind_address.clone(), u32::from(remote_port))
-        .await
-        .map_err(|error| {
-            ToolError::new(format!(
-                "The server refused to listen on {remote_bind_address}:{remote_port}: {error}"
-            ))
-        })?;
+    let granted = bounded(
+        REQUEST_TIMEOUT,
+        &format!("have the server listen on {remote_bind_address}:{remote_port}"),
+        handle.tcpip_forward(remote_bind_address.clone(), u32::from(remote_port)),
+    )
+    .await?;
     let port = if remote_port == 0 {
         granted
     } else {
@@ -208,12 +209,12 @@ pub(crate) async fn open_remote(
         taken
     };
     if taken {
-        if let Err(error) = handle
-            .cancel_tcpip_forward(remote_bind_address.clone(), port)
-            .await
-        {
-            tracing::debug!("the refused remote forward could not be canceled: {error}");
-        }
+        best_effort(
+            CLOSE_TIMEOUT,
+            "canceling the refused remote forward",
+            handle.cancel_tcpip_forward(remote_bind_address.clone(), port),
+        )
+        .await;
         return Err(ToolError::new(format!(
             "Another forward of this connection already uses port {port} on the server; close it first or use another port."
         )));
@@ -279,9 +280,15 @@ pub(crate) async fn close(
     }
     if let Some((address, port)) = &forward.remote_listener {
         lock(targets).remove(port);
-        if let Err(error) = handle.cancel_tcpip_forward(address.clone(), *port).await {
+        if let Err(error) = bounded(
+            REQUEST_TIMEOUT,
+            "have the server stop listening",
+            handle.cancel_tcpip_forward(address.clone(), *port),
+        )
+        .await
+        {
             return Ok(format!(
-                "Forward {number} stopped here, but the server did not confirm it stopped listening: {error}"
+                "Forward {number} stopped here, but the server did not confirm it: {error}"
             ));
         }
     }

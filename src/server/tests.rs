@@ -452,9 +452,10 @@ async fn a_command_past_its_timeout_gets_term_then_kill() {
     assert!(text.contains("sent TERM, then KILL"), "{text}");
     assert!(text.contains("killed by signal KILL"), "{text}");
 
-    // More stdin than the server's window holds, to a command that never reads it.
+    // More stdin than the connection's buffers hold, to a command that never reads it: the server
+    // stops reading the connection, and the stop signals cannot be sent.
     let text = tokio::time::timeout(
-        Duration::from_secs(20),
+        Duration::from_secs(30),
         harness.ok(
             "exec",
             json!({"connection": token, "command": "sleep", "stdin": "x".repeat(8 * 1024 * 1024), "timeout_seconds": 0.5}),
@@ -463,6 +464,10 @@ async fn a_command_past_its_timeout_gets_term_then_kill() {
     .await
     .expect("exec returned despite unread stdin");
     assert!(text.contains("timed out after 0.5s"), "{text}");
+    assert!(
+        text.contains("the server stopped taking the stop signals"),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -862,7 +867,12 @@ async fn prompts_are_answered_and_programs_interrupted_with_shell_send() {
             json!({"connection": token, "shell": 1, "keys": ["ctrl+c"]}),
         )
         .await;
-    assert!(text.contains("was interrupted"), "{text}");
+    // Most shells abandon the rest of the command line when a command dies of ctrl+c; bash 3.2
+    // (macOS's sh) runs on to the done marker, so the exit code is known.
+    assert!(
+        text.contains("was interrupted") || text.contains("exited with code 130"),
+        "{text}"
+    );
     assert!(!text.ends_with('\n'), "no stray blank line: {text:?}");
     assert!(text.contains("at the prompt"), "{text}");
 

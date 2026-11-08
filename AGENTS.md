@@ -145,7 +145,10 @@ A client may cancel any call (meka does at its tool timeout, 10 minutes by defau
 drops the result unread. A canceled call must therefore change nothing the agent has not seen: shell
 tools return without consuming output or outcomes and without interrupting the command. `exec` is
 the exception, and stops its command, since nothing could read its output later. Every wait on the
-server (channel opens, writes, SFTP requests) has a timeout or watches the call's cancellation.
+server (channel opens and requests, writes, signals, closes, SFTP requests) has a timeout or watches
+the call's cancellation: russh queues every send behind the connection's outgoing data, so one
+stalled connection would otherwise hold a call forever. `client::bounded` and
+`client::best_effort` wrap the sends.
 
 ## Tests
 
