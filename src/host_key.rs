@@ -9,7 +9,7 @@ use std::{
 use hmac::{Hmac, KeyInit, Mac};
 use russh::keys::ssh_key::{
     Algorithm, Fingerprint, HashAlg, PublicKey,
-    known_hosts::{Entry, HostPatterns, KnownHosts, Marker},
+    known_hosts::{Entry, HostPatterns, Marker},
 };
 use sha1::Sha1;
 
@@ -61,11 +61,29 @@ impl ExpectedKey {
 enum Source {
     Nothing,
     Fingerprints(Vec<ExpectedKey>),
-    KnownHosts {
-        path: PathBuf,
-        entries: Vec<Entry>,
-        unreadable_lines: usize,
-    },
+    KnownHosts { path: PathBuf, file: KnownHostsFile },
+}
+
+/// The lines of a known_hosts file.
+#[derive(Debug, Default)]
+struct KnownHostsFile {
+    entries: Vec<Entry>,
+    /// Lines whose host names could be read but whose key could not, such as a key of a type
+    /// this server does not support.
+    uncheckable: Vec<UncheckableLine>,
+    /// The numbers of lines that could not be read at all, counted from 1. The hosts they list
+    /// are unknown.
+    unreadable: Vec<usize>,
+}
+
+/// A known_hosts line whose key could not be read.
+#[derive(Debug)]
+struct UncheckableLine {
+    /// The line's number, counted from 1.
+    number: usize,
+    marker: Option<Marker>,
+    patterns: HostPatterns,
+    key_type: String,
 }
 
 /// How the server's host key is checked for one connect.
@@ -141,11 +159,9 @@ impl HostKeyPolicy {
             }
             (true, Some(path)) => {
                 let text = read_small_file("known_hosts_file", &path, MAX_KNOWN_HOSTS_BYTES)?;
-                let (entries, unreadable_lines) = parse_known_hosts(&text);
                 Source::KnownHosts {
                     path,
-                    entries,
-                    unreadable_lines,
+                    file: parse_known_hosts(&text),
                 }
             }
             (true, None) => Source::Nothing,
@@ -165,9 +181,9 @@ impl HostKeyPolicy {
                     ExpectedKey::Fingerprint(_) => None,
                 })
                 .collect(),
-            Source::KnownHosts { entries, .. } => {
+            Source::KnownHosts { file, .. } => {
                 let name = lookup_name(host, port);
-                entries
+                file.entries
                     .iter()
                     .filter(|entry| {
                         entry.marker().is_none() && patterns_match(entry.host_patterns(), &name)
@@ -211,11 +227,9 @@ impl HostKeyPolicy {
                     "The server's host key does not match host_key_fingerprint. The server may have been reinstalled, or the connection may be intercepted.{other_type}"
                 ))
             }
-            Source::KnownHosts {
-                path,
-                entries,
-                unreadable_lines,
-            } => self.verify_against_known_hosts(host, port, key, path, entries, *unreadable_lines),
+            Source::KnownHosts { path, file } => {
+                self.verify_against_known_hosts(host, port, key, path, file)
+            }
         }
     }
 
@@ -225,13 +239,18 @@ impl HostKeyPolicy {
         port: u16,
         key: &PublicKey,
         path: &Path,
-        entries: &[Entry],
-        unreadable_lines: usize,
+        file: &KnownHostsFile,
     ) -> Verdict {
         let name = lookup_name(host, port);
-        let applicable: Vec<&Entry> = entries
+        let applicable: Vec<&Entry> = file
+            .entries
             .iter()
             .filter(|entry| patterns_match(entry.host_patterns(), &name))
+            .collect();
+        let uncheckable: Vec<&UncheckableLine> = file
+            .uncheckable
+            .iter()
+            .filter(|line| patterns_match(&line.patterns, &name))
             .collect();
         let revoked = applicable.iter().any(|entry| {
             matches!(entry.marker(), Some(Marker::Revoked))
@@ -241,6 +260,18 @@ impl HostKeyPolicy {
             return Verdict::Refused(format!(
                 "The server's host key is marked @revoked in {}.",
                 path.display()
+            ));
+        }
+        // A revoked key that could not be read may be the presented one when its type is.
+        if let Some(line) = uncheckable.iter().find(|line| {
+            matches!(line.marker, Some(Marker::Revoked))
+                && line.key_type == key.algorithm().as_str()
+        }) {
+            return Verdict::Refused(format!(
+                "Line {} of {} marks a key of {name} as @revoked, but the key ({}) could not be read, so whether it is the server's key is unknown. Fix the line, or check the fingerprint below another way and pass it as host_key_fingerprint.",
+                line.number,
+                path.display(),
+                line.key_type
             ));
         }
         let mut known_algorithms = Vec::new();
@@ -260,26 +291,46 @@ impl HostKeyPolicy {
                 known_algorithms.join(", ")
             ));
         }
+        // The host is listed, so accept_new_host_key does not apply to it.
+        let listed_unchecked: Vec<&UncheckableLine> = uncheckable
+            .iter()
+            .copied()
+            .filter(|line| line.marker.is_none())
+            .collect();
+        if !listed_unchecked.is_empty() {
+            let mut key_types: Vec<&str> = Vec::new();
+            for line in &listed_unchecked {
+                if !key_types.contains(&line.key_type.as_str()) {
+                    key_types.push(&line.key_type);
+                }
+            }
+            let numbers: Vec<usize> = listed_unchecked.iter().map(|line| line.number).collect();
+            return Verdict::Refused(format!(
+                "{} lists {name} only with keys that cannot be read here ({}, on {}), so the server's key cannot be verified. Check the fingerprint below another way and pass it as host_key_fingerprint.",
+                path.display(),
+                key_types.join(", "),
+                describe_lines(&numbers)
+            ));
+        }
         // A host a certificate authority vouches for is listed, so accept_new_host_key does not
         // apply to it; host certificates are not checked here, so its key cannot be verified.
-        if applicable
+        let vouched = applicable
             .iter()
             .any(|entry| matches!(entry.marker(), Some(Marker::CertAuthority)))
-        {
+            || uncheckable
+                .iter()
+                .any(|line| matches!(line.marker, Some(Marker::CertAuthority)));
+        if vouched {
             return Verdict::Refused(format!(
                 "{} trusts a certificate authority for {name}, and host certificates are not checked here, so the key cannot be verified. Check the fingerprint below another way and pass it as host_key_fingerprint.",
                 path.display()
             ));
         }
-        if unreadable_lines > 0 {
-            let unreadable = if unreadable_lines == 1 {
-                "1 line could not be read".to_owned()
-            } else {
-                format!("{unreadable_lines} lines could not be read")
-            };
+        if !file.unreadable.is_empty() {
             return Verdict::Refused(format!(
-                "{name} is not in the lines of {} that could be read, and {unreadable}, so the host cannot be taken to be new. Fix those lines, or check the fingerprint below another way and pass it as host_key_fingerprint.",
-                path.display()
+                "{name} is not in the lines of {} that could be read, and {} could not be read, so the host cannot be taken to be new. Fix them, or check the fingerprint below another way and pass it as host_key_fingerprint.",
+                path.display(),
+                describe_lines(&file.unreadable)
             ));
         }
         if self.accept_new {
@@ -294,25 +345,63 @@ impl HostKeyPolicy {
     }
 }
 
-/// Parse known_hosts text, skipping lines that are not valid entries the way OpenSSH does, and
-/// counting them, since a host such a line lists cannot be taken to be new.
-fn parse_known_hosts(text: &str) -> (Vec<Entry>, usize) {
-    // OpenSSH separates fields with any run of spaces and tabs and allows leading whitespace,
-    // while the parser splits on single spaces.
-    let normalized = text
-        .lines()
-        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut entries = Vec::new();
-    let mut unreadable_lines = 0;
-    for entry in KnownHosts::new(&normalized) {
-        match entry {
-            Ok(entry) => entries.push(entry),
-            Err(_) => unreadable_lines += 1,
+/// Parse known_hosts text. OpenSSH skips a line whose key it cannot read; such a line still
+/// concerns the hosts it names, so it is kept apart when its host names can be read, and noted as
+/// unreadable when they cannot, since the hosts it lists are then unknown.
+fn parse_known_hosts(text: &str) -> KnownHostsFile {
+    let mut file = KnownHostsFile::default();
+    for (index, line) in text.lines().enumerate() {
+        let number = index + 1;
+        let line = line.split_once('#').map_or(line, |(before, _)| before);
+        // OpenSSH separates fields with any run of spaces and tabs and allows leading whitespace,
+        // while the parser splits on single spaces.
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = Entry::from_str(&fields.join(" ")) {
+            file.entries.push(entry);
+            continue;
+        }
+        let (marker, rest) = match fields.split_first() {
+            Some((first, rest)) if first.starts_with('@') => {
+                (Marker::from_str(first).ok().map(Some), rest)
+            }
+            _ => (Some(None), fields.as_slice()),
+        };
+        let uncheckable = match (marker, rest) {
+            (Some(marker), [hosts, key_type, ..]) => {
+                HostPatterns::from_str(hosts)
+                    .ok()
+                    .map(|patterns| UncheckableLine {
+                        number,
+                        marker,
+                        patterns,
+                        key_type: (*key_type).to_owned(),
+                    })
+            }
+            _ => None,
+        };
+        match uncheckable {
+            Some(line) => file.uncheckable.push(line),
+            None => file.unreadable.push(number),
         }
     }
-    (entries, unreadable_lines)
+    file
+}
+
+/// Line numbers as words, such as `line 4` or `lines 2, 5 and 9`, naming at most five.
+fn describe_lines(numbers: &[usize]) -> String {
+    const NAMED: usize = 5;
+    let mut named: Vec<String> = numbers.iter().take(NAMED).map(usize::to_string).collect();
+    if numbers.len() > NAMED {
+        named.push(format!("{} more", numbers.len() - NAMED));
+    }
+    match named.split_last() {
+        Some((last, [])) => format!("line {last}"),
+        Some((last, rest)) => format!("lines {} and {last}", rest.join(", ")),
+        None => "no lines".to_owned(),
+    }
 }
 
 /// The name a host is recorded under in known_hosts: the hostname for port 22, `[host]:port`
@@ -432,12 +521,10 @@ mod tests {
     }
 
     fn policy_with_file(text: &str, accept_new: bool) -> HostKeyPolicy {
-        let (entries, unreadable_lines) = parse_known_hosts(text);
         HostKeyPolicy {
             source: Source::KnownHosts {
                 path: PathBuf::from("/known_hosts"),
-                entries,
-                unreadable_lines,
+                file: parse_known_hosts(text),
             },
             accept_new,
         }
@@ -496,11 +583,47 @@ mod tests {
     #[test]
     fn a_file_with_unreadable_lines_cannot_vouch_that_a_host_is_new() {
         let file = format!(
-            "example.com not-a-key\nother.example {}\n",
+            "other.example {}\n|1|!!!|!!! ssh-ed25519 AAAA\ngarbage\n",
             openssh(&random_key())
         );
+        let verdict = policy_with_file(&file, true).verify("example.com", 22, &random_key());
+        assert!(
+            matches!(&verdict, Verdict::Refused(reason) if reason.contains("lines 2 and 3")),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_of_a_type_that_cannot_be_read_concerns_only_the_hosts_its_line_names() {
+        let listed = random_key();
+        let quantum = "ssh-mldsa44-ed25519 AAAAE3NzaC1tbGRzYTQ0LWVkMjU1MTk";
+        let elsewhere = format!("pq.example {quantum}\n");
         assert!(matches!(
-            policy_with_file(&file, true).verify("example.com", 22, &random_key()),
+            policy_with_file(&elsewhere, true).verify("example.com", 22, &listed),
+            Verdict::Accepted(Verification::AcceptedNew { .. })
+        ));
+        let beside = format!("example.com {quantum}\nexample.com {}\n", openssh(&listed));
+        assert!(matches!(
+            policy_with_file(&beside, false).verify("example.com", 22, &listed),
+            Verdict::Accepted(Verification::KnownHosts(_))
+        ));
+        let only = format!("example.com {quantum}\n");
+        let verdict = policy_with_file(&only, true).verify("example.com", 22, &listed);
+        assert!(
+            matches!(&verdict, Verdict::Refused(reason) if reason.contains("ssh-mldsa44-ed25519") && reason.contains("line 1")),
+            "{verdict:?}"
+        );
+        let authority = format!("@cert-authority *.com {quantum}\n");
+        assert!(matches!(
+            policy_with_file(&authority, true).verify("example.com", 22, &listed),
+            Verdict::Refused(_)
+        ));
+        let revoked = format!(
+            "@revoked example.com ssh-ed25519 broken\nexample.com {}\n",
+            openssh(&listed)
+        );
+        assert!(matches!(
+            policy_with_file(&revoked, false).verify("example.com", 22, &listed),
             Verdict::Refused(_)
         ));
     }

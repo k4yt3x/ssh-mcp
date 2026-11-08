@@ -11,6 +11,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
 getrandom = { version = "0.4", features = ["std"] }
 hmac = "0.13"
+pkcs5 = { version = "0.8", features = ["sha1-insecure"] }
 regex = "1"
 rmcp = { version = "3.9", features = [
     "server",

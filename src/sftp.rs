@@ -2,6 +2,7 @@
 //! folders between this machine and the server.
 
 use std::{
+    borrow::Cow,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -456,19 +457,28 @@ pub(crate) async fn edit_file(
     }
     let _writing = state.text_files.write().await;
     let text = read_text(session, &path).await?;
-    let count = text.matches(&request.old_string).count();
+    let mut old_string = Cow::Borrowed(request.old_string.as_str());
+    let mut new_string = Cow::Borrowed(request.new_string.as_str());
+    let mut count = text.matches(old_string.as_ref()).count();
+    // The carriage return of a `\r\n` line ending is invisible in what read_file returns, and some
+    // clients cannot send one, so line breaks written as `\n` are also tried as the file's.
+    let as_crlf = count == 0
+        && text.contains("\r\n")
+        && old_string.contains('\n')
+        && !old_string.contains('\r');
+    if as_crlf {
+        old_string = Cow::Owned(old_string.replace('\n', "\r\n"));
+        new_string = Cow::Owned(new_string.replace("\r\n", "\n").replace('\n', "\r\n"));
+        count = text.matches(old_string.as_ref()).count();
+    }
     if count == 0 {
-        // A line ending's carriage return is invisible in what read_file returns.
-        if text.contains("\r\n")
-            && request.old_string.contains('\n')
-            && !request.old_string.contains('\r')
-        {
-            return Err(ToolError::new(format!(
-                "old_string was not found in {path}, whose lines end in \\r\\n. Write each line break in old_string and new_string as \\r\\n."
-            )));
-        }
+        let line_breaks = if as_crlf {
+            ", with its line breaks taken as \\n or as the file's \\r\\n"
+        } else {
+            ""
+        };
         return Err(ToolError::new(format!(
-            "old_string was not found in {path}. It must match exactly, including whitespace."
+            "old_string was not found in {path}{line_breaks}. It must match exactly, including whitespace."
         )));
     }
     if count > 1 && !request.replace_all {
@@ -477,9 +487,9 @@ pub(crate) async fn edit_file(
         )));
     }
     let edited = if request.replace_all {
-        text.replace(&request.old_string, &request.new_string)
+        text.replace(old_string.as_ref(), &new_string)
     } else {
-        text.replacen(&request.old_string, &request.new_string, 1)
+        text.replacen(old_string.as_ref(), &new_string, 1)
     };
     stop_if_canceled(cancel)?;
     write_text(session, &path, &edited).await?;
@@ -488,7 +498,12 @@ pub(crate) async fn edit_file(
     } else {
         format!("{count} places")
     };
-    Ok(format!("Edited {path}: replaced {places}."))
+    let line_breaks = if as_crlf {
+        ", with line breaks written as the file's \\r\\n"
+    } else {
+        ""
+    };
+    Ok(format!("Edited {path}: replaced {places}{line_breaks}."))
 }
 
 /// Counts for a transfer's result.

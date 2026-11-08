@@ -9,7 +9,8 @@
   `@revoked` work. A host covered by `@cert-authority` is refused, since host certificates are not
   checked.
 - `accept_new_host_key`: accepts a host that cannot be checked. A host the file lists with a
-  different key is still refused, and so is any host when some lines of the file cannot be read.
+  different key, or only with keys of types that cannot be read here, is still refused, and so is
+  any host when a line's host names cannot be read.
 
 Every connect and every host key refusal shows the key, with a known_hosts line to record.
 

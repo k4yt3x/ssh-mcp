@@ -38,6 +38,8 @@
   be absolute or start with `~/`.
 - `write_file` and `edit_file` write in place, keeping the owner, permissions and symlinks. On one
   connection they run one at a time, so edits sent together all apply.
+- In a file whose lines end in `\r\n`, `edit_file` also matches `\n` line breaks and writes them as
+  `\r\n`.
 - `upload` and `download` copy folders recursively, with permissions and symlinks. Each file is
   written under a temporary name and renamed into place. An existing destination needs `overwrite`,
   and its parent folder must exist. Folders that already exist keep their permissions.
@@ -53,9 +55,11 @@
   paused for 1 second, and at most 10 seconds later, even if a background process still holds its
   output open.
 - A shell keeps at most 16 MiB of unread output. `shell_close` returns at most 64 KiB.
-- zsh set to save each line as it is entered (`INC_APPEND_HISTORY`, `SHARE_HISTORY`) saves the
-  setup line unless `HIST_IGNORE_SPACE` is also set, and busybox ash may save it too. ksh, which
-  opens its history file at startup, may save every line.
+- A server that makes `HISTFILE` read-only, as audit setups do, keeps the whole history, the setup
+  line and command wrappers included. zsh set to save each line as it is entered
+  (`INC_APPEND_HISTORY`, `SHARE_HISTORY`) saves the setup line unless `HIST_IGNORE_SPACE` is also
+  set, and busybox ash may save it too. ksh, which opens its history file at startup, may save
+  every line.
 - `read_file` and `edit_file` take files up to 64 MiB; `read_file` returns 256 KiB at a time.
 - `download` refuses a folder with more than 100,000 entries.
 - Servers cap channels per connection (OpenSSH's `MaxSessions`, 10 by default). Each shell,

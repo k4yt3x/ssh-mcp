@@ -1111,6 +1111,21 @@ mod tests {
         );
     }
 
+    /// An encrypted PKCS#8 key as LibreSSL writes it, and so `ssh-keygen -m PKCS8` on macOS and
+    /// Windows: PBKDF2 with HMAC-SHA1. A throwaway ECDSA key whose passphrase is `secret`.
+    const PKCS8_SHA1_KEY: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIHmMFEGCSqGSIb3DQEFDTBEMCMGCSqGSIb3DQEFDDAWBBAYAGEHoDZa8vZ0h01w\nbNHqAgIIADAdBglghkgBZQMEAQIEEApCvCeSu1O3QNWQrOEoUgcEgZCmoNC8dOTR\nUDX79+8BvvZ5iHWMhcWFYSWKbzonM9NVV8eqtD5PIjEHZqsLhp3UtbcbanOjyCqP\n8BiiZjUSu4zmla3k9A8vxxBQQwyZukqJLVkDMPoZYMYaNmSgGVpPDY3JeezbMokf\nJppbyXBkQ2JYvXIMZP9e0T0szcO39uEYblZgIKdLHeZrT8nZSeH8M04=\n-----END ENCRYPTED PRIVATE KEY-----";
+
+    #[test]
+    fn an_encrypted_pkcs8_key_from_libressl_is_read_with_its_passphrase() {
+        let material = Material::Content(PKCS8_SHA1_KEY.to_owned());
+        let missing = load_private_key(&material, None).unwrap_err();
+        assert!(
+            missing.message().contains("pass private_key_passphrase"),
+            "{missing}"
+        );
+        assert!(load_private_key(&material, Some("secret")).is_ok());
+    }
+
     #[test]
     fn legacy_algorithms_come_after_the_defaults() {
         let defaults = Preferred::default();

@@ -1369,6 +1369,7 @@ dependencies = [
  "pbkdf2",
  "rand_core",
  "scrypt",
+ "sha1",
  "sha2",
  "spki",
 ]
@@ -2110,6 +2111,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "libc",
+ "pkcs5",
  "pty-process",
  "regex",
  "rmcp",

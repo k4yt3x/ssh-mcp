@@ -1029,14 +1029,22 @@ async fn remote_text_files_are_read_written_and_edited_in_place() {
 
     let crlf = sshd.directory.path().join("crlf.txt");
     std::fs::write(&crlf, "one\r\ntwo\r\n").expect("file");
-    let refused = harness
-        .error("edit_file", json!({"connection": token, "path": crlf.display().to_string(), "old_string": "one\ntwo", "new_string": "1\n2"}))
+    let text = harness
+        .ok("edit_file", json!({"connection": token, "path": crlf.display().to_string(), "old_string": "one\ntwo", "new_string": "1\n2"}))
         .await;
-    assert!(refused.contains("\\r\\n"), "{refused}");
-    harness
-        .ok("edit_file", json!({"connection": token, "path": crlf.display().to_string(), "old_string": "one\r\ntwo", "new_string": "1\r\n2"}))
-        .await;
+    assert!(text.contains("\\r\\n"), "{text}");
     assert_eq!(std::fs::read_to_string(&crlf).expect("file"), "1\r\n2\r\n");
+    harness
+        .ok("edit_file", json!({"connection": token, "path": crlf.display().to_string(), "old_string": "1\r\n2", "new_string": "one\r\ntwo"}))
+        .await;
+    assert_eq!(
+        std::fs::read_to_string(&crlf).expect("file"),
+        "one\r\ntwo\r\n"
+    );
+    let refused = harness
+        .error("edit_file", json!({"connection": token, "path": crlf.display().to_string(), "old_string": "one\nthree", "new_string": "x"}))
+        .await;
+    assert!(refused.contains("was not found"), "{refused}");
 
     let missing = sshd.directory.path().join("missing");
     let refused = harness

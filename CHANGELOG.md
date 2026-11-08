@@ -22,14 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - RSA certificate logins work against OpenSSH 8.8 and later.
 - `upload` and `write_file` refuse pipes and devices instead of hanging.
 - Edits sent together on one connection no longer overwrite each other.
+- Multi-line `edit_file` edits work on files with `\r\n` line endings.
+- Encrypted PKCS#8 keys made by `ssh-keygen` on macOS and Windows can be read.
 - A canceled transfer, file edit or forward makes no further changes.
 - A server without SFTP is reported at once instead of after two minutes.
 - `exec` keeps output that arrives after the exit status and no longer misreports timeouts.
-- Errors for missing folders, CRLF files, encrypted keys and SFTP failures say how to fix them.
+- Errors for missing folders, encrypted keys and SFTP failures say how to fix them.
 
 ### Security
 
-- A host key no longer passes as new when known_hosts has tab-separated or unreadable lines.
+- A host key no longer passes as new when a known_hosts line uses tabs or is damaged.
 - A private key passed by mistake as `private_key_file` is no longer quoted back in errors.
 
 ## [0.1.0] - 2026-11-08

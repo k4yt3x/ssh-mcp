@@ -297,7 +297,8 @@ struct EditFileArguments {
     connection: String,
     /// Remote path; relative paths and `~/` start at the login directory.
     path: String,
-    /// Exact text to replace, including whitespace.
+    /// Exact text to replace, including whitespace. In a file whose lines end in `\r\n`, `\n` also
+    /// matches them.
     old_string: String,
     /// Replacement text.
     new_string: String,
