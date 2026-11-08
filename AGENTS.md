@@ -44,6 +44,10 @@ agent's facts (keys, passwords, expected host keys) arrive as tool arguments.
 - Written for users: what they will see, break on or must do, one line per entry under 100
   characters. No internal names or module paths. Breaking changes get an inline `**Breaking:**`
   prefix.
+- A release is a tag named by the bare version (`0.1.0`, no `v`). Before tagging, set the version in
+  `Cargo.toml` (and `Cargo.lock`), move `[Unreleased]` under `## [<version>] - <date>`, and update
+  the compare links at the end. The release workflow drafts the GitHub release from that section
+  and fails without it.
 
 ## Documentation
 

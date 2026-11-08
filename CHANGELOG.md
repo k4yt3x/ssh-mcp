@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-08
+
 ### Added
 
 - An MCP server over stdio for SSH; each connection is reached only through its token.
@@ -18,3 +20,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A shell call the client cancels interrupts nothing; its output and outcome wait for `shell_read`.
 - SFTP tools to read, write, edit, upload and download files; `--disable-sftp` removes them.
 - Local, remote and dynamic (SOCKS5) port forwarding, each enabled by its own flag.
+
+[Unreleased]: https://github.com/k4yt3x/ssh-mcp/compare/0.1.0...HEAD
+[0.1.0]: https://github.com/k4yt3x/ssh-mcp/releases/tag/0.1.0

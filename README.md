@@ -9,11 +9,12 @@ The agent passes the key or password, and a host key check, when it connects.
 
 ## Install
 
-```console
-$ cargo install --path .
-```
+Download a build for Linux, macOS or Windows from
+[Releases](https://github.com/k4yt3x/ssh-mcp/releases), or build it with Rust 1.89 or newer:
 
-Needs Rust 1.89 or newer. Runs on Linux, macOS and Windows.
+```console
+$ cargo install --locked --git https://github.com/k4yt3x/ssh-mcp
+```
 
 ## Use
 
