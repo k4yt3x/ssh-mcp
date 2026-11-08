@@ -1,8 +1,9 @@
 # ssh-mcp
 
 An [MCP](https://modelcontextprotocol.io) server that gives an AI agent SSH: persistent
-connections, commands, interactive shells, SFTP file transfer and port forwarding. It speaks MCP
-over stdio, so any MCP client can run it.
+connections, commands, interactive shells, SFTP file transfer and port forwarding. It is primarily
+designed for and tested on [meka](https://github.com/k4yt3x/meka), but it speaks MCP over stdio,
+so any MCP client can run it.
 
 It is standalone: nothing from `~/.ssh` is used, there is no config file, and nothing is stored.
 The agent passes the key or password, and a host key check, when it connects.
