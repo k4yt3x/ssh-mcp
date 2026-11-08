@@ -458,21 +458,31 @@ pub(crate) async fn edit_file(
     let _writing = state.text_files.write().await;
     let text = read_text(session, &path).await?;
     let mut old_string = Cow::Borrowed(request.old_string.as_str());
-    let mut new_string = Cow::Borrowed(request.new_string.as_str());
     let mut count = text.matches(old_string.as_ref()).count();
     // The carriage return of a `\r\n` line ending is invisible in what read_file returns, and some
-    // clients cannot send one, so line breaks written as `\n` are also tried as the file's.
-    let as_crlf = count == 0
+    // clients cannot send one, so line breaks written as `\n` are also tried as the file's, and
+    // written as the file's where its lines all end that way or old_string matched that way.
+    let matched_as_crlf = count == 0
         && text.contains("\r\n")
         && old_string.contains('\n')
         && !old_string.contains('\r');
-    if as_crlf {
+    if matched_as_crlf {
         old_string = Cow::Owned(old_string.replace('\n', "\r\n"));
-        new_string = Cow::Owned(new_string.replace("\r\n", "\n").replace('\n', "\r\n"));
         count = text.matches(old_string.as_ref()).count();
     }
+    let only_crlf =
+        text.contains("\r\n") && text.matches('\n').count() == text.matches("\r\n").count();
+    let new_string = if matched_as_crlf || only_crlf {
+        request
+            .new_string
+            .replace("\r\n", "\n")
+            .replace('\n', "\r\n")
+    } else {
+        request.new_string.clone()
+    };
+    let rewrote_line_breaks = matched_as_crlf || new_string != request.new_string;
     if count == 0 {
-        let line_breaks = if as_crlf {
+        let line_breaks = if matched_as_crlf {
             ", with its line breaks taken as \\n or as the file's \\r\\n"
         } else {
             ""
@@ -498,8 +508,8 @@ pub(crate) async fn edit_file(
     } else {
         format!("{count} places")
     };
-    let line_breaks = if as_crlf {
-        ", with line breaks written as the file's \\r\\n"
+    let line_breaks = if rewrote_line_breaks {
+        ", with line breaks taken as the file's \\r\\n"
     } else {
         ""
     };

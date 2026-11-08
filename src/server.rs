@@ -300,7 +300,7 @@ struct EditFileArguments {
     /// Exact text to replace, including whitespace. In a file whose lines end in `\r\n`, `\n` also
     /// matches them.
     old_string: String,
-    /// Replacement text.
+    /// Replacement text. In a file whose lines all end in `\r\n`, its `\n` are written as `\r\n`.
     new_string: String,
     /// Replace every match instead of requiring exactly one.
     replace_all: Option<bool>,

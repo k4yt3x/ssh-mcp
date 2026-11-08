@@ -38,8 +38,9 @@
   be absolute or start with `~/`.
 - `write_file` and `edit_file` write in place, keeping the owner, permissions and symlinks. On one
   connection they run one at a time, so edits sent together all apply.
-- In a file whose lines end in `\r\n`, `edit_file` also matches `\n` line breaks and writes them as
-  `\r\n`.
+- In a file whose lines end in `\r\n`, `edit_file` also matches `\n` in `old_string` against them,
+  and writes `\n` in `new_string` as `\r\n`. In a file that mixes both endings, `new_string` is
+  written as sent unless `old_string` matched that way.
 - `upload` and `download` copy folders recursively, with permissions and symlinks. Each file is
   written under a temporary name and renamed into place. An existing destination needs `overwrite`,
   and its parent folder must exist. Folders that already exist keep their permissions.
@@ -60,6 +61,10 @@
   (`INC_APPEND_HISTORY`, `SHARE_HISTORY`) saves the setup line unless `HIST_IGNORE_SPACE` is also
   set, and busybox ash may save it too. ksh, which opens its history file at startup, may save
   every line.
+- Some encrypted keys cannot be decrypted: old-style PEM keys other than RSA with AES-128-CBC, and
+  PKCS#8 keys with PBES1 or PKCS#12 encryption. `ssh-keygen -p -f <key file>` rewrites them in
+  OpenSSH format; for PBES1, `openssl pkcs8 -topk8 -v2 aes-256-cbc` re-encrypts them (OpenSSL 3
+  also needs `-provider legacy -provider default`).
 - `read_file` and `edit_file` take files up to 64 MiB; `read_file` returns 256 KiB at a time.
 - `download` refuses a folder with more than 100,000 entries.
 - Servers cap channels per connection (OpenSSH's `MaxSessions`, 10 by default). Each shell,

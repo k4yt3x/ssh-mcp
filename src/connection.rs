@@ -400,21 +400,200 @@ fn load_private_key(
         Material::File(_) => "private_key_file",
     };
     let text = material.read(argument)?;
-    let encrypted = || {
-        ToolError::new(format!(
-            "The key in {argument} is encrypted; pass private_key_passphrase."
-        ))
+    let decoded = match decode_secret_key(&text, passphrase) {
+        // A passphrase given for a PKCS#8 key that is not encrypted makes it unreadable.
+        Err(error) if passphrase.is_some() => decode_secret_key(&text, None).map_err(|_| error),
+        decoded => decoded,
     };
-    decode_secret_key(&text, passphrase).map_err(|error| match error {
-        russh::keys::Error::KeyIsEncrypted => encrypted(),
-        _ if passphrase.is_none() && is_encrypted_key(&text) => encrypted(),
-        _ if passphrase.is_some() => ToolError::new(format!(
+    decoded
+        .or_else(|error| read_explicit_curve_pkcs8(&text, passphrase).ok_or(error))
+        .map_err(|error| key_failure(argument, &text, passphrase.is_some(), &error))
+}
+
+/// Read a PKCS#8 ECDSA key that gives its curve by its parameters rather than by name, as
+/// LibreSSL writes it (and so `ssh-keygen -m PKCS8` on macOS). russh reads such a key only in
+/// the SEC1 form, so the key is decrypted here and passed on in that form, and russh still works
+/// out the curve. `None` when `text` is no such key or `passphrase` does not decrypt it.
+fn read_explicit_curve_pkcs8(text: &str, passphrase: Option<&str>) -> Option<PrivateKey> {
+    use pkcs5::der::{
+        Encode, Error, Header, Length, Reader, SliceReader, Tag, TagMode, TagNumber, Tagged,
+        asn1::{AnyRef, ContextSpecific, ObjectIdentifier, OctetStringRef},
+    };
+    const EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+
+    let (label, der) = pkcs5::der::pem::decode_vec(text.trim().as_bytes()).ok()?;
+    let info = match (label, passphrase) {
+        ("PRIVATE KEY", _) => der,
+        ("ENCRYPTED PRIVATE KEY", Some(passphrase)) => {
+            let (scheme, mut data) = SliceReader::new(&der)
+                .ok()?
+                .sequence(|info| {
+                    let scheme: pkcs5::EncryptionScheme = info.decode()?;
+                    let data: &OctetStringRef = info.decode()?;
+                    Ok::<_, Error>((scheme, data.as_bytes().to_vec()))
+                })
+                .ok()?;
+            let length = scheme.decrypt_in_place(passphrase, &mut data).ok()?.len();
+            data.truncate(length);
+            data
+        }
+        _ => return None,
+    };
+    // PrivateKeyInfo ::= SEQUENCE { version, SEQUENCE { algorithm, parameters }, privateKey, ... }
+    let (algorithm, parameters, ec_private_key) = SliceReader::new(&info)
+        .ok()?
+        .sequence(|info| {
+            let _version: u8 = info.decode()?;
+            let (algorithm, parameters) = info.sequence(|identifier| {
+                let algorithm: ObjectIdentifier = identifier.decode()?;
+                let parameters: AnyRef<'_> = identifier.decode()?;
+                Ok::<_, Error>((algorithm, parameters))
+            })?;
+            let ec_private_key: &OctetStringRef = info.decode()?;
+            info.drain(info.remaining_len())?;
+            Ok::<_, Error>((algorithm, parameters, ec_private_key))
+        })
+        .ok()?;
+    if algorithm != EC_PUBLIC_KEY || parameters.tag() != Tag::Sequence {
+        return None;
+    }
+    // ECPrivateKey ::= SEQUENCE { version, privateKey, [0] parameters, [1] publicKey }
+    let secret = SliceReader::new(ec_private_key.as_bytes())
+        .ok()?
+        .sequence(|key| {
+            let _version: u8 = key.decode()?;
+            let secret: &OctetStringRef = key.decode()?;
+            key.drain(key.remaining_len())?;
+            Ok::<_, Error>(secret)
+        })
+        .ok()?;
+    let mut fields = 1u8.to_der().ok()?;
+    fields.extend(secret.to_der().ok()?);
+    fields.extend(
+        ContextSpecific {
+            tag_number: TagNumber(0),
+            tag_mode: TagMode::Explicit,
+            value: parameters,
+        }
+        .to_der()
+        .ok()?,
+    );
+    let mut sec1 = Header::new(Tag::Sequence, Length::try_from(fields.len()).ok()?)
+        .to_der()
+        .ok()?;
+    sec1.extend(fields);
+    russh::keys::pkcs8::decode_pkcs8(&sec1, None).ok()
+}
+
+/// Why the key text in `argument` could not be read, with what to do about it.
+fn key_failure(
+    argument: &str,
+    text: &str,
+    passphrase_given: bool,
+    error: &russh::keys::Error,
+) -> ToolError {
+    if let Some((encryption, remedy)) = undecryptable_encryption(text, error) {
+        return ToolError::new(format!(
+            "The key in {argument} is encrypted {encryption}, which this server cannot decrypt. {remedy}"
+        ));
+    }
+    if matches!(error, russh::keys::Error::KeyIsEncrypted)
+        || (!passphrase_given && is_encrypted_key(text))
+    {
+        return ToolError::new(format!(
+            "The key in {argument} is encrypted; pass private_key_passphrase."
+        ));
+    }
+    if passphrase_given {
+        ToolError::new(format!(
             "The key in {argument} could not be read: the passphrase may be wrong, or it is not a private key."
-        )),
-        _ => ToolError::new(format!(
+        ))
+    } else {
+        ToolError::new(format!(
             "{argument} does not hold a private key in a format this server reads (OpenSSH, PEM or PuTTY)."
+        ))
+    }
+}
+
+/// A passphrase used only to learn whether a PKCS#8 key's encryption can be undone here: with a
+/// scheme that can, a wrong passphrase fails the decryption itself; with one that cannot, any
+/// passphrase fails before it.
+const PROBE_PASSPHRASE: &str = "ssh-mcp: not the passphrase";
+
+/// The remedy for a key whose encryption cannot be undone here.
+const REWRITE_WITH_SSH_KEYGEN: &str =
+    "Rewrite it in OpenSSH format with ssh-keygen -p -f on the key file, then pass it again.";
+
+/// The remedy for a PBES1 key, which ssh-keygen cannot read where OpenSSL 3 is its library.
+const REENCRYPT_WITH_OPENSSL: &str = "Re-encrypt it with openssl pkcs8 -topk8 -v2 aes-256-cbc -in <key file> -out <new key file> (OpenSSL 3 also needs -provider legacy -provider default), then pass the new file.";
+
+/// How key text is encrypted when this server cannot decrypt it, such as `in the old PEM format
+/// (EC key, AES-128-CBC)`, and the remedy, or `None`. `error` is why reading it failed.
+fn undecryptable_encryption(
+    text: &str,
+    error: &russh::keys::Error,
+) -> Option<(String, &'static str)> {
+    // russh decrypts an old-style PEM key only with AES-128-CBC, and reads what it decrypts as an
+    // RSA key.
+    if text.contains("Proc-Type: 4,ENCRYPTED") {
+        let cipher = text
+            .lines()
+            .find_map(|line| line.strip_prefix("DEK-Info:"))
+            .and_then(|info| info.split(',').next())
+            .map_or("unknown cipher", str::trim);
+        let kind = text
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("-----BEGIN ")?
+                    .strip_suffix(" PRIVATE KEY-----")
+            })
+            .unwrap_or("unknown");
+        let readable = kind == "RSA" && cipher == "AES-128-CBC";
+        return (!readable).then(|| {
+            (
+                format!("in the old PEM format ({kind} key, {cipher})"),
+                REWRITE_WITH_SSH_KEYGEN,
+            )
+        });
+    }
+    if !text.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----") {
+        return None;
+    }
+    // The failure tells when the passphrase reached the decryption; otherwise a probe finds out.
+    let probe_error;
+    let failure = match pkcs5_error(error) {
+        Some(failure) => Some(failure),
+        None => match decode_secret_key(text, Some(PROBE_PASSPHRASE)) {
+            Ok(_) => return None,
+            Err(error) => {
+                probe_error = error;
+                pkcs5_error(&probe_error)
+            }
+        },
+    };
+    match failure {
+        Some(pkcs5::Error::DecryptFailed) => None,
+        Some(pkcs5::Error::NoPbes1CryptSupport) => {
+            Some(("as PKCS#8 with PBES1".to_owned(), REENCRYPT_WITH_OPENSSL))
+        }
+        _ => Some((
+            "as PKCS#8 with an older scheme".to_owned(),
+            REWRITE_WITH_SSH_KEYGEN,
         )),
-    })
+    }
+}
+
+/// The PKCS#5 error behind a failure to read a key, such as the decryption failing, as it does
+/// with a wrong passphrase.
+fn pkcs5_error(error: &russh::keys::Error) -> Option<&pkcs5::Error> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(inner) = current {
+        if let Some(found) = inner.downcast_ref::<pkcs5::Error>() {
+            return Some(found);
+        }
+        current = inner.source();
+    }
+    None
 }
 
 /// Whether key text is an encrypted PuTTY or PKCS#8 key. Their decoders fail on one without a
@@ -1124,6 +1303,68 @@ mod tests {
             "{missing}"
         );
         assert!(load_private_key(&material, Some("secret")).is_ok());
+    }
+
+    /// Throwaway keys `openssl` wrote, encrypted with the passphrase `secret`: an EC key in the old
+    /// PEM format with AES-128-CBC, and PKCS#8 keys encrypted with PBES1, with a PKCS#12 scheme and
+    /// with PBES2 and 3DES. The last is the same key unencrypted.
+    const PEM_EC_KEY: &str = "-----BEGIN EC PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,59160C6CC267C33CCF631F7F48A2DB92\n\nqorNBsM/HQ7saNgzsKPqr8qFhv5kDHNFEHDTcHZODEX1iddZQ+7f32NMJHZSGCaM\nycJ+sJ2D9r7VZ6tiadKsjHoy4zVDj3EKvVCOUib0Ncrg3lTuDp+pQity+cmaMp6s\njvUE43Oe2RifVCaUeO9rxwRzHBrSJEBvd0HqH9YkVpc=\n-----END EC PRIVATE KEY-----";
+    const PKCS8_PBES1_KEY: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIGwMBsGCSqGSIb3DQEFAzAOBAhJOVhPaXmd3gICCAAEgZDzIWs5w/f0vDrv3Mym\nb6fWjxk8vs1woFySu2MG4jdH5PFjQMC1ysZ6boYDqEF8sAJFC1dB7S0Licpg+m89\nR94tJhCCfEFfj7Egkbrg1U/JQt8bOgRG100ka4ef5Fr1M5O7h6A2FSUAvmu0HAn2\nAY4wk6RYR1sCY6jrOVQY1LPRKC9lSCNVpTM9vjIsXIrCO/s=\n-----END ENCRYPTED PRIVATE KEY-----";
+    const PKCS8_PKCS12_KEY: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIGxMBwGCiqGSIb3DQEMAQMwDgQIc8ZkwzB6/NoCAggABIGQaO8qEgzGjaDMM2J+\nCrStxDh7tDMWigwuWK8djizTWataTkwCx/7qSLNHBh9ATs8wimrJKFcjYwEa+4Em\n+G0c/3otF61NROCNBmKwG9qJC+eZnTD0+IjLV4Qzqhd4mQMJf4oECqdQm2hjjcJd\nC+/3sfChzkDU2TpJEKXFIqsENrG8fIHwkS9JmHX+IQr+9dVg\n-----END ENCRYPTED PRIVATE KEY-----";
+    const PKCS8_3DES_KEY: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIHrMFYGCSqGSIb3DQEFDTBJMDEGCSqGSIb3DQEFDDAkBBAffM9iyCUZo5XyqHZw\n6lL7AgIIADAMBggqhkiG9w0CCQUAMBQGCCqGSIb3DQMHBAiSlSzEHbhaxgSBkPT1\n7ISh2Ei1yGdwrsFrs7DqMvQtG2SST8GcGT8jgSnPEPV7wnobkgIm7x6SxcIrp9Y7\nduh2KpqQDXO4QuLSHZbfdIbccKPMsuu9KeoJpTJK7uLIXdT9ya6BzIEb1euShnGr\n7ehUhPPd20S2mLGqZaG9zu7uq9n7dI9JMf5xLLXzTwfgSm/8TAe7WXH5ON81iA==\n-----END ENCRYPTED PRIVATE KEY-----";
+    const PKCS8_PLAIN_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgFWzMUwpMfKI8jimJ\nOU+JHePeedkb2e6Tfe1MxK+hxvuhRANCAAQPdUEpRF++fepfl177NszL+BjZ1Obf\npjS71Gp1OwxC7cz6hDTvOsxrRkdw2PjfQXGBIpBg+4VdkfwFbb5biD7Z\n-----END PRIVATE KEY-----";
+
+    #[test]
+    fn a_key_encrypted_in_a_way_that_cannot_be_decrypted_says_so_whatever_the_passphrase() {
+        let pem_3des = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: DES-EDE3-CBC,E6285D6D6D63AA01\n\nAAAA\n-----END RSA PRIVATE KEY-----";
+        for (text, remedy) in [
+            (PEM_EC_KEY, "ssh-keygen -p"),
+            (pem_3des, "ssh-keygen -p"),
+            (PKCS8_PBES1_KEY, "openssl pkcs8"),
+            (PKCS8_PKCS12_KEY, "ssh-keygen -p"),
+        ] {
+            let material = Material::Content(text.to_owned());
+            for passphrase in [None, Some("secret")] {
+                let refused = load_private_key(&material, passphrase).unwrap_err();
+                assert!(
+                    refused.message().contains("cannot decrypt")
+                        && refused.message().contains(remedy),
+                    "{passphrase:?}: {refused}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pkcs8_key_is_read_when_encrypted_with_3des_or_given_a_needless_passphrase() {
+        let encrypted = Material::Content(PKCS8_3DES_KEY.to_owned());
+        assert!(load_private_key(&encrypted, Some("secret")).is_ok());
+        let wrong = load_private_key(&encrypted, Some("wrong")).unwrap_err();
+        assert!(
+            wrong.message().contains("passphrase may be wrong"),
+            "{wrong}"
+        );
+        let plain = Material::Content(PKCS8_PLAIN_KEY.to_owned());
+        assert!(load_private_key(&plain, Some("needless")).is_ok());
+    }
+
+    /// Throwaway ECDSA keys as `ssh-keygen -m PKCS8` writes them on macOS (OpenSSH 10 with
+    /// LibreSSL 3.3.6): the curve is given by its parameters rather than by name. The first is
+    /// encrypted with the passphrase `secret`.
+    const PKCS8_EXPLICIT_CURVE_KEY: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIBzzBJBgkqhkiG9w0BBQ0wPDAbBgkqhkiG9w0BBQwwDgQIZqkuqpVxsE0CAggA\nMB0GCWCGSAFlAwQBAgQQuVV14jVQFv9GsDk6xbn9dASCAYC4Yf9vDd8Dpz/aDQBX\nETnNJd+7nWjU0Mp5vtLVeKPHioX/uOb/VSv52fQcULadEnpIM0AWHXdKLKe147JF\niB76RbkQvW3RD8MLE8fqaByJrCtwKlvlfgavzW49zZX4R9/hXHoXE673Mu72aJ4c\nzA2LWIuzxreyIgwUvWsRbog5BqlYPR5oC1H5leXUhTv9NYm+uHpQc0T10TsZ7nVL\n221fLerlv3tQjCnPFgQkaASOL87qE4bFRTRHXQeaw7FvJCVurmWTdEg89S0OKHsT\nJhgQa4YsSLjXXDsKeS627qrmu/9d6Ck3CxgybsP4AYjwrtMW/PHkf/JoMxVav/pR\nZiTYxySTJvSoZB1O9jfV1tQiLL5N5m3BkT5AZsUTcaCINSZQxPx2AE6pE86BaZZV\n05DI7mu8e+hXrH3LzT4f+oBTHCZ/OU8ouJGnKE1OTZ561njcOr1MyqAZERewztuk\n1Kvkn1pg/hdea2OFg/9FEuE+oBGLe5+7XSeMGyvnODm6+Yg=\n-----END ENCRYPTED PRIVATE KEY-----";
+    const PKCS8_EXPLICIT_CURVE_PLAIN_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIBeQIBADCCAQMGByqGSM49AgEwgfcCAQEwLAYHKoZIzj0BAQIhAP////8AAAAB\nAAAAAAAAAAAAAAAA////////////////MFsEIP////8AAAABAAAAAAAAAAAAAAAA\n///////////////8BCBaxjXYqjqT57PrvVV2mIa8ZR0GsMxTsPY7zjw+J9JgSwMV\nAMSdNgiG5wSTamZ44ROdJreBn36QBEEEaxfR8uEsQkf4vOblY6RA8ncDfYEt6zOg\n9KE5RdiYwpZP40Li/hp/m47n60p8D54WK84zV2sxXs7LtkBoN79R9QIhAP////8A\nAAAA//////////+85vqtpxeehPO5ysL8YyVRAgEBBG0wawIBAQQg9D7sg/f/0r0/\nzXJc6ffx0RLPNYadm6MdsoYAm+UaYxGhRANCAATN+sMk0HmAQJZZshpK6hUCVdWi\nN7ixibBR7M/zWGxChVjNkqLa5jusrm87LiOYbEh1m/g+VZGaka/asl37g5Bm\n-----END PRIVATE KEY-----";
+
+    #[test]
+    fn an_ecdsa_key_that_spells_out_its_curve_is_read() {
+        let encrypted = Material::Content(PKCS8_EXPLICIT_CURVE_KEY.to_owned());
+        assert!(load_private_key(&encrypted, Some("secret")).is_ok());
+        let wrong = load_private_key(&encrypted, Some("wrong")).unwrap_err();
+        assert!(
+            wrong.message().contains("passphrase may be wrong"),
+            "{wrong}"
+        );
+        let plain = Material::Content(PKCS8_EXPLICIT_CURVE_PLAIN_KEY.to_owned());
+        assert!(load_private_key(&plain, None).is_ok());
     }
 
     #[test]

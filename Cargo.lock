@@ -1366,6 +1366,7 @@ dependencies = [
  "aes-gcm",
  "cbc",
  "der",
+ "des",
  "pbkdf2",
  "rand_core",
  "scrypt",

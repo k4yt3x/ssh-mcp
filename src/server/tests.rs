@@ -1045,6 +1045,24 @@ async fn remote_text_files_are_read_written_and_edited_in_place() {
         .error("edit_file", json!({"connection": token, "path": crlf.display().to_string(), "old_string": "one\nthree", "new_string": "x"}))
         .await;
     assert!(refused.contains("was not found"), "{refused}");
+    std::fs::write(&crlf, "header\r\nanchor\r\nfooter\r\n").expect("file");
+    let text = harness
+        .ok("edit_file", json!({"connection": token, "path": crlf.display().to_string(), "old_string": "anchor", "new_string": "anchor\ninserted"}))
+        .await;
+    assert!(text.contains("\\r\\n"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(&crlf).expect("file"),
+        "header\r\nanchor\r\ninserted\r\nfooter\r\n"
+    );
+    let mixed = sshd.directory.path().join("mixed.txt");
+    std::fs::write(&mixed, "a\r\nb\nc\r\n").expect("file");
+    harness
+        .ok("edit_file", json!({"connection": token, "path": mixed.display().to_string(), "old_string": "b", "new_string": "b\nx"}))
+        .await;
+    assert_eq!(
+        std::fs::read_to_string(&mixed).expect("file"),
+        "a\r\nb\nx\nc\r\n"
+    );
 
     let missing = sshd.directory.path().join("missing");
     let refused = harness
