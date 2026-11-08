@@ -22,7 +22,7 @@ use crate::{
         CLOSE_TIMEOUT, REQUEST_TIMEOUT, RemoteForwardTarget, RemoteForwardTargets, SshHandle,
         best_effort, bounded,
     },
-    output::{ToolError, lock},
+    output::{ToolError, format_duration, lock},
 };
 
 /// How long a SOCKS client has to finish its handshake.
@@ -31,6 +31,16 @@ const SOCKS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a listener waits after a failed accept before the next. A failure such as running out
 /// of file descriptors repeats at once, and retrying without a pause would spin a CPU.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+fn port_taken(port: u32) -> ToolError {
+    ToolError::new(format!(
+        "Another forward of this connection already uses port {port} on the server; close it first or use another port."
+    ))
+}
+
+fn canceled() -> ToolError {
+    ToolError::new("The call was canceled, so no forward was opened.")
+}
 
 /// The forwards of one connection.
 #[derive(Default)]
@@ -112,6 +122,26 @@ where
     })
 }
 
+/// Open a `direct-tcpip` channel to `host:port` for a connection from `peer`.
+async fn open_direct_channel(
+    handle: &SshHandle,
+    peer: SocketAddr,
+    host: &str,
+    port: u16,
+) -> Result<russh::Channel<russh::client::Msg>, ToolError> {
+    bounded(
+        REQUEST_TIMEOUT,
+        &format!("reach {host}:{port} from the server"),
+        handle.channel_open_direct_tcpip(
+            host,
+            u32::from(port),
+            peer.ip().to_string(),
+            u32::from(peer.port()),
+        ),
+    )
+    .await
+}
+
 /// Carry one accepted connection through a `direct-tcpip` channel to `host:port`.
 async fn carry_through_server(
     handle: &SshHandle,
@@ -120,22 +150,14 @@ async fn carry_through_server(
     host: &str,
     port: u16,
 ) {
-    match handle
-        .channel_open_direct_tcpip(
-            host,
-            u32::from(port),
-            peer.ip().to_string(),
-            u32::from(peer.port()),
-        )
-        .await
-    {
+    match open_direct_channel(handle, peer, host, port).await {
         Ok(channel) => {
             let mut stream = channel.into_stream();
             if let Err(error) = tokio::io::copy_bidirectional(&mut socket, &mut stream).await {
                 tracing::debug!("forwarded connection to {host}:{port} ended: {error}");
             }
         }
-        Err(error) => tracing::debug!("the server could not reach {host}:{port}: {error}"),
+        Err(error) => tracing::debug!("{error}"),
     }
 }
 
@@ -148,8 +170,12 @@ pub(crate) async fn open_local(
     remote_host: String,
     remote_port: u16,
     local_port: u16,
+    cancel: &CancellationToken,
 ) -> Result<String, ToolError> {
     let (listener, port) = bind_loopback(local_port).await?;
+    if cancel.is_cancelled() {
+        return Err(canceled());
+    }
     let stop = connection_closed.child_token();
     let task = spawn_accept_loop(listener, port, stop.clone(), {
         let remote_host = remote_host.clone();
@@ -173,28 +199,77 @@ pub(crate) async fn open_local(
     ))
 }
 
-/// Start a remote forward: connections to `remote_port` on the server reach
+/// What `forward_remote` asks for.
+pub(crate) struct RemoteForwardRequest {
+    /// The address the server listens on.
+    pub(crate) bind_address: String,
+    /// The port the server listens on; 0 lets it pick.
+    pub(crate) port: u16,
+    /// The host each connection is carried to from this machine.
+    pub(crate) local_host: String,
+    /// The port on `local_host`.
+    pub(crate) local_port: u16,
+}
+
+/// Start a remote forward: connections to the requested port on the server reach
 /// `local_host:local_port` from this machine.
 pub(crate) async fn open_remote(
     handle: &SshHandle,
     table: &Mutex<ForwardTable>,
     targets: &RemoteForwardTargets,
-    remote_bind_address: String,
-    remote_port: u16,
-    local_host: String,
-    local_port: u16,
+    request: RemoteForwardRequest,
+    cancel: &CancellationToken,
 ) -> Result<String, ToolError> {
-    let granted = bounded(
-        REQUEST_TIMEOUT,
-        &format!("have the server listen on {remote_bind_address}:{remote_port}"),
-        handle.tcpip_forward(remote_bind_address.clone(), u32::from(remote_port)),
-    )
-    .await?;
+    let RemoteForwardRequest {
+        bind_address: remote_bind_address,
+        port: remote_port,
+        local_host,
+        local_port,
+    } = request;
+    if cancel.is_cancelled() {
+        return Err(canceled());
+    }
+    // Checked before the request too: canceling a request that got no answer would otherwise stop
+    // the forward already on that port.
+    if remote_port != 0 && lock(targets).contains_key(&u32::from(remote_port)) {
+        return Err(port_taken(u32::from(remote_port)));
+    }
+    let action = format!("have the server listen on {remote_bind_address}:{remote_port}");
+    let request = handle.tcpip_forward(remote_bind_address.clone(), u32::from(remote_port));
+    let granted = match tokio::time::timeout(REQUEST_TIMEOUT, request).await {
+        Ok(Ok(granted)) => granted,
+        Ok(Err(error)) => return Err(ToolError::new(format!("Could not {action}: {error}"))),
+        Err(_) => {
+            // The server may still grant the request, and nothing here would know to stop it.
+            if remote_port != 0 {
+                best_effort(
+                    CLOSE_TIMEOUT,
+                    "canceling the unanswered remote forward",
+                    handle
+                        .cancel_tcpip_forward(remote_bind_address.clone(), u32::from(remote_port)),
+                )
+                .await;
+            }
+            return Err(ToolError::new(format!(
+                "Could not {action}: the server did not respond within {}.",
+                format_duration(REQUEST_TIMEOUT)
+            )));
+        }
+    };
     let port = if remote_port == 0 {
         granted
     } else {
         u32::from(remote_port)
     };
+    if cancel.is_cancelled() {
+        best_effort(
+            CLOSE_TIMEOUT,
+            "canceling the remote forward of a canceled call",
+            handle.cancel_tcpip_forward(remote_bind_address.clone(), port),
+        )
+        .await;
+        return Err(canceled());
+    }
     // The server names only the port when it forwards a connection, so two forwards on one port
     // (on different addresses) could not be told apart.
     let taken = {
@@ -215,9 +290,7 @@ pub(crate) async fn open_remote(
             handle.cancel_tcpip_forward(remote_bind_address.clone(), port),
         )
         .await;
-        return Err(ToolError::new(format!(
-            "Another forward of this connection already uses port {port} on the server; close it first or use another port."
-        )));
+        return Err(port_taken(port));
     }
     let description =
         format!("remote {remote_bind_address}:{port} on the server to {local_host}:{local_port}");
@@ -239,8 +312,12 @@ pub(crate) async fn open_dynamic(
     table: &Mutex<ForwardTable>,
     connection_closed: &CancellationToken,
     local_port: u16,
+    cancel: &CancellationToken,
 ) -> Result<String, ToolError> {
     let (listener, port) = bind_loopback(local_port).await?;
+    if cancel.is_cancelled() {
+        return Err(canceled());
+    }
     let stop = connection_closed.child_token();
     let task = spawn_accept_loop(listener, port, stop.clone(), move |socket, peer| {
         let handle = Arc::clone(&handle);
@@ -293,7 +370,7 @@ pub(crate) async fn close(
         }
     }
     Ok(format!(
-        "Forward {number} ({}) stopped.",
+        "Forward {number} ({}) stopped; connections already open through it go on until they close.",
         forward.description
     ))
 }
@@ -372,22 +449,33 @@ async fn serve_socks_client(handle: &SshHandle, mut socket: TcpStream, peer: Soc
             Ok(Err(None)) | Err(_) => return,
         };
     let (host, port) = target;
-    let channel = match handle
-        .channel_open_direct_tcpip(
+    let opened = tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        handle.channel_open_direct_tcpip(
             host.as_str(),
             u32::from(port),
             peer.ip().to_string(),
             u32::from(peer.port()),
-        )
-        .await
-    {
-        Ok(channel) => channel,
-        Err(error) => {
+        ),
+    )
+    .await;
+    let reached = match opened {
+        Ok(Ok(channel)) => Ok(channel),
+        Ok(Err(error)) => {
             tracing::debug!("the server could not reach {host}:{port}: {error}");
-            let code = match error {
+            Err(match error {
                 russh::Error::ChannelOpenFailure(_) => SOCKS_CONNECTION_REFUSED,
                 _ => SOCKS_GENERAL_FAILURE,
-            };
+            })
+        }
+        Err(_) => {
+            tracing::debug!("the server did not answer for {host}:{port}");
+            Err(SOCKS_GENERAL_FAILURE)
+        }
+    };
+    let channel = match reached {
+        Ok(channel) => channel,
+        Err(code) => {
             if let Err(error) = send_socks_reply(&mut socket, code).await {
                 tracing::debug!("a SOCKS refusal could not be sent: {error}");
             }

@@ -195,13 +195,21 @@ impl HostKeyPolicy {
             }
             Source::Fingerprints(expected) => {
                 if expected.iter().any(|expected| expected.matches(key)) {
-                    Verdict::Accepted(Verification::Fingerprint)
-                } else {
-                    Verdict::Refused(
-                        "The server's host key does not match host_key_fingerprint. The server may have been reinstalled, or the connection may be intercepted."
-                            .to_owned(),
-                    )
+                    return Verdict::Accepted(Verification::Fingerprint);
                 }
+                // A fingerprint does not say which key type to ask for, so the server presents
+                // its preferred key, which a fingerprint of its other keys does not match.
+                let other_type = if expected
+                    .iter()
+                    .all(|expected| matches!(expected, ExpectedKey::Fingerprint(_)))
+                {
+                    " If the fingerprint is of another of the server's keys, pass that key's public key line instead, which asks the server for that key type."
+                } else {
+                    ""
+                };
+                Verdict::Refused(format!(
+                    "The server's host key does not match host_key_fingerprint. The server may have been reinstalled, or the connection may be intercepted.{other_type}"
+                ))
             }
             Source::KnownHosts {
                 path,
@@ -263,29 +271,42 @@ impl HostKeyPolicy {
                 path.display()
             ));
         }
+        if unreadable_lines > 0 {
+            let unreadable = if unreadable_lines == 1 {
+                "1 line could not be read".to_owned()
+            } else {
+                format!("{unreadable_lines} lines could not be read")
+            };
+            return Verdict::Refused(format!(
+                "{name} is not in the lines of {} that could be read, and {unreadable}, so the host cannot be taken to be new. Fix those lines, or check the fingerprint below another way and pass it as host_key_fingerprint.",
+                path.display()
+            ));
+        }
         if self.accept_new {
             return Verdict::Accepted(Verification::AcceptedNew {
                 known_hosts_file: Some(path.to_path_buf()),
             });
         }
-        let unreadable = if unreadable_lines > 0 {
-            format!(" ({unreadable_lines} lines of it could not be read)")
-        } else {
-            String::new()
-        };
         Verdict::Refused(format!(
-            "{name} is not in {}{unreadable}. Pass accept_new_host_key to accept a host that is not listed.",
+            "{name} is not in {}. Pass accept_new_host_key to accept a host that is not listed.",
             path.display()
         ))
     }
 }
 
 /// Parse known_hosts text, skipping lines that are not valid entries the way OpenSSH does, and
-/// counting them so a refusal can say the file was only partly read.
+/// counting them, since a host such a line lists cannot be taken to be new.
 fn parse_known_hosts(text: &str) -> (Vec<Entry>, usize) {
+    // OpenSSH separates fields with any run of spaces and tabs and allows leading whitespace,
+    // while the parser splits on single spaces.
+    let normalized = text
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut entries = Vec::new();
     let mut unreadable_lines = 0;
-    for entry in KnownHosts::new(text) {
+    for entry in KnownHosts::new(&normalized) {
         match entry {
             Ok(entry) => entries.push(entry),
             Err(_) => unreadable_lines += 1,
@@ -454,6 +475,33 @@ mod tests {
         assert!(matches!(
             policy_with_file(&file, true).verify("example.com", 22, &key),
             Verdict::Accepted(Verification::AcceptedNew { .. })
+        ));
+    }
+
+    #[test]
+    fn lines_separated_by_tabs_or_runs_of_spaces_are_read() {
+        let listed = random_key();
+        let line = openssh(&listed).replacen(' ', "  ", 1);
+        let file = format!("  example.com\t{line}\n");
+        assert!(matches!(
+            policy_with_file(&file, true).verify("example.com", 22, &random_key()),
+            Verdict::Refused(_)
+        ));
+        assert!(matches!(
+            policy_with_file(&file, false).verify("example.com", 22, &listed),
+            Verdict::Accepted(Verification::KnownHosts(_))
+        ));
+    }
+
+    #[test]
+    fn a_file_with_unreadable_lines_cannot_vouch_that_a_host_is_new() {
+        let file = format!(
+            "example.com not-a-key\nother.example {}\n",
+            openssh(&random_key())
+        );
+        assert!(matches!(
+            policy_with_file(&file, true).verify("example.com", 22, &random_key()),
+            Verdict::Refused(_)
         ));
     }
 

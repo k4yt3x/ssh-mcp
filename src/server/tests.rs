@@ -10,9 +10,15 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
+use tokio_util::sync::CancellationToken;
 
 use super::{Features, SshServer};
-use crate::testing::{Logins, Sshd, TestServer, random_private_key};
+use crate::{
+    connection::{ConnectRequest, Material, Registry, Target},
+    output::Progress,
+    sftp,
+    testing::{Logins, Sshd, TestServer, random_private_key},
+};
 
 const ALL_FEATURES: Features = Features {
     sftp: true,
@@ -649,15 +655,18 @@ async fn terminal_connection() -> (TestServer, Harness, String) {
     (server, harness, token)
 }
 
+/// Whether a program is installed in one of the usual folders.
+#[cfg(unix)]
+fn installed(name: &str) -> bool {
+    ["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+        .iter()
+        .any(|directory| std::path::Path::new(directory).join(name).exists())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_managed_shell_keeps_state_and_reports_exit_codes() {
     let (_server, harness, token) = terminal_connection().await;
-    let installed = |name: &str| {
-        ["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]
-            .iter()
-            .any(|directory| std::path::Path::new(directory).join(name).exists())
-    };
     let mut programs = vec![None];
     programs.extend(
         ["sh", "bash", "zsh"]
@@ -671,7 +680,10 @@ async fn a_managed_shell_keeps_state_and_reports_exit_codes() {
             arguments["command"] = json!(program);
         }
         let opened = harness.ok("shell_open", arguments).await;
-        assert!(opened.contains("managed mode"), "{program:?}: {opened}");
+        assert!(
+            opened.contains("opened in managed mode"),
+            "{program:?}: {opened}"
+        );
         let shell = shell_number(&opened);
 
         let text = harness
@@ -692,6 +704,16 @@ async fn a_managed_shell_keeps_state_and_reports_exit_codes() {
             .ok("shell_run", json!({"connection": token, "shell": shell, "command": "git --version >/dev/null 2>&1; echo \"pager=$PAGER\""}))
             .await;
         assert!(text.contains("pager=cat"), "{program:?}: {text}");
+        let text = harness
+            .ok(
+                "shell_run",
+                json!({"connection": token, "shell": shell, "command": "echo \"a!b\""}),
+            )
+            .await;
+        assert!(
+            text.contains("a!b") && text.contains("exited with code 0"),
+            "{program:?}: {text}"
+        );
 
         let long = format!("printf '%s' '{}' | wc -c", "a".repeat(6000));
         let text = harness
@@ -775,6 +797,20 @@ async fn a_long_command_keeps_running_and_its_end_is_reported_once() {
         "the end is reported once: {text}"
     );
     assert!(text.contains("at the prompt"), "{text}");
+
+    harness
+        .ok(
+            "shell_run",
+            json!({"connection": token, "shell": 1, "command": "sleep 100", "wait_seconds": 0.2}),
+        )
+        .await;
+    let text = harness
+        .ok("shell_close", json!({"connection": token, "shell": 1}))
+        .await;
+    assert!(
+        text.contains("`sleep 100` was still running and was hung up"),
+        "{text}"
+    );
 }
 
 #[cfg(unix)]
@@ -870,7 +906,7 @@ async fn prompts_are_answered_and_programs_interrupted_with_shell_send() {
     // Most shells abandon the rest of the command line when a command dies of ctrl+c; bash 3.2
     // (macOS's sh) runs on to the done marker, so the exit code is known.
     assert!(
-        text.contains("was interrupted") || text.contains("exited with code 130"),
+        text.contains("ended without an exit code") || text.contains("exited with code 130"),
         "{text}"
     );
     assert!(!text.ends_with('\n'), "no stray blank line: {text:?}");
@@ -990,6 +1026,40 @@ async fn remote_text_files_are_read_written_and_edited_in_place() {
             "through the link\n"
         );
     }
+
+    let crlf = sshd.directory.path().join("crlf.txt");
+    std::fs::write(&crlf, "one\r\ntwo\r\n").expect("file");
+    let refused = harness
+        .error("edit_file", json!({"connection": token, "path": crlf.display().to_string(), "old_string": "one\ntwo", "new_string": "1\n2"}))
+        .await;
+    assert!(refused.contains("\\r\\n"), "{refused}");
+    harness
+        .ok("edit_file", json!({"connection": token, "path": crlf.display().to_string(), "old_string": "one\r\ntwo", "new_string": "1\r\n2"}))
+        .await;
+    assert_eq!(std::fs::read_to_string(&crlf).expect("file"), "1\r\n2\r\n");
+
+    let missing = sshd.directory.path().join("missing");
+    let refused = harness
+        .error(
+            "read_file",
+            json!({"connection": token, "path": missing.join("file.txt").display().to_string()}),
+        )
+        .await;
+    assert_eq!(refused.matches("No such file").count(), 1, "{refused}");
+    let refused = harness
+        .error("write_file", json!({"connection": token, "path": missing.join("file.txt").display().to_string(), "content": "x"}))
+        .await;
+    assert!(
+        refused.contains("does not exist on the server"),
+        "{refused}"
+    );
+    let refused = harness
+        .error("upload", json!({"connection": token, "local_path": crlf.display().to_string(), "remote_path": missing.join("file.txt").display().to_string()}))
+        .await;
+    assert!(
+        refused.contains("does not exist on the server"),
+        "{refused}"
+    );
 
     std::fs::write(sshd.directory.path().join("binary"), [0u8, 1, 2]).expect("binary");
     let refused = harness
@@ -1307,6 +1377,60 @@ async fn special_files_are_skipped_and_read_only_folders_copy_both_ways() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn merging_into_an_existing_folder_keeps_its_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some((sshd, harness, token)) = sshd_connection().await else {
+        return;
+    };
+    let mode = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .expect("folder")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    let local = tempfile::tempdir().expect("local folder");
+    let source = local.path().join("source");
+    std::fs::create_dir(&source).expect("folder");
+    std::fs::write(source.join("file.txt"), "x").expect("file");
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o700)).expect("mode");
+    let remote = sshd.directory.path().join("existing");
+    std::fs::create_dir(&remote).expect("folder");
+    std::fs::set_permissions(&remote, std::fs::Permissions::from_mode(0o751)).expect("mode");
+
+    harness
+        .ok("upload", json!({"connection": token, "local_path": source.display().to_string(), "remote_path": remote.display().to_string(), "overwrite": true}))
+        .await;
+    assert_eq!(mode(&remote), 0o751);
+    assert!(remote.join("file.txt").exists());
+    harness
+        .ok("download", json!({"connection": token, "remote_path": remote.display().to_string(), "local_path": source.display().to_string(), "overwrite": true}))
+        .await;
+    assert_eq!(mode(&source), 0o700);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_folder_with_a_name_sftp_cannot_carry_is_refused_before_anything_is_written() {
+    use std::os::unix::ffi::OsStrExt;
+    let Some((sshd, harness, token)) = sshd_connection().await else {
+        return;
+    };
+    let local = tempfile::tempdir().expect("local folder");
+    let source = local.path().join("source");
+    std::fs::create_dir(&source).expect("folder");
+    std::fs::write(source.join("a-first.txt"), "x").expect("file");
+    std::fs::write(source.join(std::ffi::OsStr::from_bytes(b"b-\xff.txt")), "x").expect("file");
+    let destination = sshd.directory.path().join("uploaded");
+    let refused = harness
+        .error("upload", json!({"connection": token, "local_path": source.display().to_string(), "remote_path": destination.display().to_string()}))
+        .await;
+    assert!(refused.contains("not UTF-8"), "{refused}");
+    assert!(!destination.exists());
+}
+
 #[tokio::test]
 async fn exec_returns_when_the_command_exits_though_a_background_process_holds_its_output() {
     let Some((_sshd, harness, token)) = sshd_connection().await else {
@@ -1323,4 +1447,462 @@ async fn exec_returns_when_the_command_exits_though_a_background_process_holds_i
     assert!(text.starts_with("[exit code 0 after"), "{text}");
     assert!(text.contains("holds its output open"), "{text}");
     assert!(text.ends_with("--- stdout ---\nhi"), "{text}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_local_special_file_is_refused_without_waiting_for_it() {
+    let Some((sshd, harness, token)) = sshd_connection().await else {
+        return;
+    };
+    let local = tempfile::tempdir().expect("local folder");
+    let fifo = local.path().join("a-fifo");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(made.success());
+    let destination = sshd.directory.path().join("special");
+    for source in [std::path::PathBuf::from("/dev/null"), fifo] {
+        let upload = harness.error("upload", json!({"connection": token, "local_path": source.display().to_string(), "remote_path": destination.display().to_string()}));
+        let refused = tokio::time::timeout(Duration::from_secs(10), upload)
+            .await
+            .expect("the upload waited for the file");
+        assert!(refused.contains("not a regular file"), "{refused}");
+        assert!(!destination.exists(), "{}", source.display());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_remote_special_file_is_refused_without_blocking_the_sftp_session() {
+    let Some((sshd, harness, token)) = sshd_connection().await else {
+        return;
+    };
+    let fifo = sshd.directory.path().join("a-fifo");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(made.success());
+    for target in [std::path::PathBuf::from("/dev/null"), fifo] {
+        let write = harness.error(
+            "write_file",
+            json!({"connection": token, "path": target.display().to_string(), "content": "x"}),
+        );
+        let refused = tokio::time::timeout(Duration::from_secs(10), write)
+            .await
+            .expect("the write waited for the file");
+        assert!(refused.contains("not a regular file"), "{refused}");
+    }
+    let notes = sshd.directory.path().join("notes.txt");
+    std::fs::write(&notes, "still answering\n").expect("file");
+    let text = harness
+        .ok(
+            "read_file",
+            json!({"connection": token, "path": notes.display().to_string()}),
+        )
+        .await;
+    assert_eq!(text, "still answering\n");
+}
+
+#[tokio::test]
+async fn a_certificate_logs_in_for_rsa_and_ed25519_keys() {
+    let folder = tempfile::tempdir().expect("key folder");
+    let key_file = |name: &str| folder.path().join(name).display().to_string();
+    let keygen = |arguments: &[&str]| {
+        std::process::Command::new("ssh-keygen")
+            .arg("-q")
+            .args(arguments)
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    if !keygen(&["-t", "ed25519", "-N", "", "-f", &key_file("ca")]) {
+        assert!(
+            std::env::var_os("SSH_MCP_REQUIRE_SSHD").is_none(),
+            "ssh-keygen is required"
+        );
+        return;
+    }
+    let Some(sshd) = Sshd::start_with(&format!("TrustedUserCAKeys {}.pub\n", key_file("ca"))).await
+    else {
+        return;
+    };
+    for kind in ["rsa", "ed25519"] {
+        let user_key = key_file(kind);
+        assert!(keygen(&["-t", kind, "-N", "", "-f", &user_key]));
+        assert!(keygen(&[
+            "-s",
+            &key_file("ca"),
+            "-I",
+            "test",
+            "-n",
+            &sshd.user,
+            "-V",
+            "+1h",
+            &format!("{user_key}.pub"),
+        ]));
+        let harness = Harness::start(ALL_FEATURES).await;
+        let text = harness
+            .ok(
+                "connect",
+                json!({
+                    "host": "127.0.0.1",
+                    "port": sshd.port,
+                    "user": sshd.user,
+                    "private_key_file": user_key,
+                    "certificate_file": format!("{user_key}-cert.pub"),
+                    "host_key_fingerprint": sshd.host_key.fingerprint(HashAlg::Sha256).to_string(),
+                }),
+            )
+            .await;
+        assert!(text.contains("Logged in with: publickey"), "{kind}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn a_server_without_sftp_is_reported_at_once() {
+    let server = TestServer::start(password_server_logins()).await;
+    let harness = Harness::start(ALL_FEATURES).await;
+    let token = password_connection(&harness, &server).await;
+    let read = harness.error(
+        "read_file",
+        json!({"connection": token, "path": "notes.txt"}),
+    );
+    let refused = tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .expect("the refusal was not read");
+    assert!(refused.contains("Use exec instead"), "{refused}");
+}
+
+#[tokio::test]
+async fn edits_made_at_the_same_time_all_land() {
+    let Some((sshd, harness, token)) = sshd_connection().await else {
+        return;
+    };
+    let path = sshd.directory.path().join("shared.txt");
+    std::fs::write(&path, "alpha\nbeta\ngamma\n").expect("file");
+    let edit = |old: &str, new: &str| {
+        harness.call(
+            "edit_file",
+            json!({"connection": token, "path": path.display().to_string(), "old_string": old, "new_string": new}),
+        )
+    };
+    let results = tokio::join!(
+        edit("alpha", "ALPHA"),
+        edit("beta", "BETA"),
+        edit("gamma", "GAMMA")
+    );
+    for (is_error, text) in [results.0, results.1, results.2] {
+        assert!(!is_error, "{text}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("file"),
+        "ALPHA\nBETA\nGAMMA\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_managed_shell_leaves_nothing_in_the_shell_history() {
+    let (_server, harness, token) = terminal_connection().await;
+    let folder = tempfile::tempdir().expect("history folder");
+    // zsh with incremental history writes each line as it is entered, before the setup line
+    // can unset HISTFILE; ignoring lines that start with a space is what keeps that one out.
+    let shells = [
+        ("bash", "bash"),
+        ("zsh", "zsh"),
+        ("zsh", "zsh -o inc_append_history -o hist_ignore_space"),
+    ];
+    for (index, (name, program)) in shells.into_iter().enumerate() {
+        if !installed(name) {
+            continue;
+        }
+        let history = folder.path().join(format!("history-{index}"));
+        let command = format!(
+            "HISTFILE='{}' SAVEHIST=100 exec {program}",
+            history.display()
+        );
+        let opened = harness
+            .ok(
+                "shell_open",
+                json!({"connection": token, "command": command}),
+            )
+            .await;
+        assert!(
+            opened.contains("opened in managed mode"),
+            "{program}: {opened}"
+        );
+        let shell = shell_number(&opened);
+        harness
+            .ok(
+                "shell_run",
+                json!({"connection": token, "shell": shell, "command": "echo hello"}),
+            )
+            .await;
+        let text = harness
+            .ok(
+                "shell_send",
+                json!({"connection": token, "shell": shell, "text": "exit\n", "wait_seconds": 10}),
+            )
+            .await;
+        assert!(text.contains("has exited"), "{program}: {text}");
+        let saved = std::fs::read_to_string(&history).unwrap_or_default();
+        assert!(!saved.contains("6973"), "{program}: {saved}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_managed_shell_runs_no_command_hooks_even_with_a_read_only_history_file() {
+    let (_server, harness, token) = terminal_connection().await;
+    let folder = tempfile::tempdir().expect("startup files");
+    let hooks = folder.path().join("hooks");
+    let quoted = hooks.display();
+    std::fs::write(
+        folder.path().join(".zshrc"),
+        format!(
+            "HISTFILE='{}/history'; readonly HISTFILE\npreexec() {{ print -r -- \"$1\" >> '{quoted}'; }}\nzshaddhistory() {{ print -r -- \"$1\" >> '{quoted}'; }}\n",
+            folder.path().display()
+        ),
+    )
+    .expect(".zshrc");
+    std::fs::write(
+        folder.path().join("bashrc"),
+        format!("trap 'echo \"$BASH_COMMAND\" >> '\\''{quoted}'\\' DEBUG\n"),
+    )
+    .expect("bashrc");
+    let shells = [
+        (
+            "zsh",
+            format!("ZDOTDIR='{}' exec zsh", folder.path().display()),
+        ),
+        (
+            "bash",
+            format!("exec bash --rcfile '{}/bashrc' -i", folder.path().display()),
+        ),
+    ];
+    for (name, command) in shells {
+        if !installed(name) {
+            continue;
+        }
+        let opened = harness
+            .ok(
+                "shell_open",
+                json!({"connection": token, "command": command}),
+            )
+            .await;
+        assert!(
+            opened.contains("opened in managed mode"),
+            "{name}: {opened}"
+        );
+        let shell = shell_number(&opened);
+        let text = harness
+            .ok(
+                "shell_run",
+                json!({"connection": token, "shell": shell, "command": "echo hook-check"}),
+            )
+            .await;
+        assert!(text.contains("exited with code 0"), "{name}: {text}");
+        harness
+            .ok("shell_close", json!({"connection": token, "shell": shell}))
+            .await;
+        let recorded = std::fs::read_to_string(&hooks).unwrap_or_default();
+        assert!(!recorded.contains("hook-check"), "{name}: {recorded}");
+    }
+}
+
+/// A connection to `sshd` made without the MCP layer, with its SFTP session, so a test can call
+/// the file functions with a cancellation token it controls.
+async fn direct_sftp(
+    sshd: &Sshd,
+    registry: &Registry,
+) -> (
+    crate::connection::ConnectionUse,
+    std::sync::Arc<russh_sftp::client::SftpSession>,
+) {
+    let connected = crate::connection::connect(registry, ConnectRequest {
+        target: Target {
+            host: "127.0.0.1".to_owned(),
+            port: sshd.port,
+            user: sshd.user.clone(),
+        },
+        private_key: Some(Material::File(sshd.client_key_file.display().to_string())),
+        private_key_passphrase: None,
+        certificate: None,
+        password: None,
+        host_key_fingerprints: vec![sshd.host_key.fingerprint(HashAlg::Sha256).to_string()],
+        known_hosts_file: None,
+        accept_new_host_key: false,
+        via: None,
+        allow_legacy_algorithms: false,
+        idle_timeout: None,
+        connect_timeout: Duration::from_secs(15),
+    })
+    .await
+    .expect("connect");
+    let connection = registry.get(&token_from(&connected)).expect("connection");
+    let session = sftp::session(
+        &connection.handle,
+        &connection.sftp,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("sftp");
+    (connection, session)
+}
+
+/// Cancel `token` as soon as `folder` holds an entry whose name does not start with a dot.
+fn cancel_on_first_entry(
+    folder: std::path::PathBuf,
+    token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let appeared = std::fs::read_dir(&folder).is_ok_and(|mut entries| {
+                entries.any(|entry| {
+                    entry.is_ok_and(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+                })
+            });
+            if appeared {
+                token.cancel();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+}
+
+// The watcher has to run while the download creates folders, which takes no await.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transfer_canceled_midway_stops_before_its_next_change() {
+    let Some(sshd) = Sshd::start().await else {
+        return;
+    };
+    let registry = Registry::default();
+    let (connection, session) = direct_sftp(&sshd, &registry).await;
+    const FOLDERS: usize = 2000;
+    let local = tempfile::tempdir().expect("local folder");
+    let source = local.path().join("source");
+    let remote_source = sshd.directory.path().join("remote-source");
+    for index in 0..FOLDERS {
+        std::fs::create_dir_all(source.join(format!("d{index:04}"))).expect("folder");
+        std::fs::create_dir_all(remote_source.join(format!("d{index:04}"))).expect("folder");
+    }
+    let count = |folder: &std::path::Path| std::fs::read_dir(folder).map_or(0, Iterator::count);
+
+    let uploaded = sshd.directory.path().join("uploaded");
+    let token = CancellationToken::new();
+    let watcher = cancel_on_first_entry(uploaded.clone(), token.clone());
+    let request = sftp::UploadRequest {
+        local_path: source.display().to_string(),
+        remote_path: uploaded.display().to_string(),
+        overwrite: false,
+        mode: None,
+        reversed_symlink_arguments: connection.is_openssh(),
+    };
+    let result = sftp::upload(&session, request, &token, &mut Progress::none()).await;
+    watcher.await.expect("watcher");
+    assert!(result.is_err(), "{result:?}");
+    assert!(
+        count(&uploaded) < FOLDERS,
+        "the upload went on after the cancel"
+    );
+
+    let downloaded = local.path().join("downloaded");
+    let token = CancellationToken::new();
+    let watcher = cancel_on_first_entry(downloaded.clone(), token.clone());
+    let request = sftp::DownloadRequest {
+        remote_path: remote_source.display().to_string(),
+        local_path: downloaded.display().to_string(),
+        overwrite: false,
+    };
+    let result = sftp::download(
+        &connection.handle,
+        &session,
+        request,
+        &token,
+        &mut Progress::none(),
+    )
+    .await;
+    watcher.await.expect("watcher");
+    assert!(result.is_err(), "{result:?}");
+    assert!(
+        count(&downloaded) < FOLDERS,
+        "the download went on after the cancel"
+    );
+}
+
+#[tokio::test]
+async fn a_call_canceled_before_it_changes_anything_changes_nothing() {
+    let Some(sshd) = Sshd::start().await else {
+        return;
+    };
+    let registry = Registry::default();
+    let (connection, session) = direct_sftp(&sshd, &registry).await;
+    let canceled = CancellationToken::new();
+    canceled.cancel();
+    let remote = sshd.directory.path();
+    let local = tempfile::tempdir().expect("local folder");
+    let source = local.path().join("source");
+    std::fs::create_dir_all(source.join("nested")).expect("folders");
+    std::fs::write(source.join("nested/empty"), "").expect("file");
+
+    for source in [source.clone(), source.join("nested/empty")] {
+        let destination = remote.join("uploaded");
+        let request = sftp::UploadRequest {
+            local_path: source.display().to_string(),
+            remote_path: destination.display().to_string(),
+            overwrite: false,
+            mode: None,
+            reversed_symlink_arguments: connection.is_openssh(),
+        };
+        let result = sftp::upload(&session, request, &canceled, &mut Progress::none()).await;
+        assert!(result.is_err(), "{result:?}");
+        assert!(!destination.exists(), "{} was uploaded", source.display());
+    }
+
+    std::fs::create_dir(remote.join("tree")).expect("remote folder");
+    std::fs::write(remote.join("tree/empty"), "").expect("remote file");
+    for source in [remote.join("tree"), remote.join("tree/empty")] {
+        let destination = local.path().join("downloaded");
+        let request = sftp::DownloadRequest {
+            remote_path: source.display().to_string(),
+            local_path: destination.display().to_string(),
+            overwrite: false,
+        };
+        let result = sftp::download(
+            &connection.handle,
+            &session,
+            request,
+            &canceled,
+            &mut Progress::none(),
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert!(!destination.exists(), "{} was downloaded", source.display());
+    }
+
+    let written = remote.join("written.txt");
+    let result = sftp::write_file(
+        &connection.sftp,
+        &session,
+        &written.display().to_string(),
+        "text",
+        &canceled,
+    )
+    .await;
+    assert!(result.is_err(), "{result:?}");
+    assert!(!written.exists());
+    let edited = remote.join("edited.txt");
+    std::fs::write(&edited, "before\n").expect("remote file");
+    let request = sftp::EditRequest {
+        path: edited.display().to_string(),
+        old_string: "before".to_owned(),
+        new_string: "after".to_owned(),
+        replace_all: false,
+    };
+    let result = sftp::edit_file(&connection.sftp, &session, request, &canceled).await;
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(std::fs::read_to_string(&edited).expect("file"), "before\n");
 }

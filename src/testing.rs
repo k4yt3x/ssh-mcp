@@ -255,6 +255,16 @@ impl server::Handler for TestHandler {
         Ok(())
     }
 
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        _name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_failure(channel)?;
+        Ok(())
+    }
+
     async fn signal(
         &mut self,
         channel: ChannelId,
@@ -540,7 +550,12 @@ impl Sshd {
     /// `SSH_MCP_REQUIRE_SSHD` set, as CI sets it where sshd is installed, that is a failure
     /// instead, so the tests that need it cannot pass by skipping.
     pub(crate) async fn start() -> Option<Self> {
-        match Self::try_start().await {
+        Self::start_with("").await
+    }
+
+    /// Start the server with `extra_config` added to its sshd_config, as [`Sshd::start`] does.
+    pub(crate) async fn start_with(extra_config: &str) -> Option<Self> {
+        match Self::try_start(extra_config).await {
             Ok(sshd) => Some(sshd),
             Err(reason) => {
                 assert!(
@@ -553,7 +568,7 @@ impl Sshd {
         }
     }
 
-    async fn try_start() -> Result<Self, String> {
+    async fn try_start(extra_config: &str) -> Result<Self, String> {
         let binary = ["/usr/sbin/sshd", "/usr/bin/sshd", "/usr/local/sbin/sshd"]
             .into_iter()
             .map(Path::new)
@@ -575,49 +590,78 @@ impl Sshd {
             client_key.public_key().to_openssh().expect("public key"),
         )
         .expect("authorized_keys");
-        let port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            probe.local_addr().expect("address").port()
-        };
-        let config = directory.path().join("sshd_config");
-        std::fs::write(
-            &config,
-            format!(
-                "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nPidFile none\nAuthorizedKeysFile {}\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nStrictModes no\nSubsystem sftp internal-sftp\nLogLevel ERROR\n",
-                host_key_file.display(),
-                authorized_keys.display()
-            ),
-        )
-        .expect("sshd_config");
-        let mut child = std::process::Command::new(binary)
-            .args(["-D", "-e", "-f"])
-            .arg(&config)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|error| format!("sshd could not be started: {error}"))?;
-        let address: SocketAddr = format!("127.0.0.1:{port}").parse().expect("address");
-        for _ in 0..100 {
-            if TcpStream::connect(address).await.is_ok() {
-                return Ok(Self {
-                    port,
-                    client_key_file,
-                    host_key: host_key.public_key().clone(),
-                    user,
-                    directory,
-                    child,
-                });
+        // The port is picked by binding and releasing it, so another test can take it before
+        // sshd binds it; sshd then exits, and its port answers with something else. Readiness
+        // is the SSH banner from a running sshd, and a lost port is retried with a new one.
+        let mut failures = Vec::new();
+        for _ in 0..5 {
+            let port = {
+                let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+                probe.local_addr().expect("address").port()
+            };
+            let config = directory.path().join("sshd_config");
+            std::fs::write(
+                &config,
+                format!(
+                    "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nPidFile none\nAuthorizedKeysFile {}\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nStrictModes no\nSubsystem sftp internal-sftp\nLogLevel ERROR\n{extra_config}",
+                    host_key_file.display(),
+                    authorized_keys.display()
+                ),
+            )
+            .expect("sshd_config");
+            let mut child = std::process::Command::new(binary)
+                .args(["-D", "-e", "-f"])
+                .arg(&config)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|error| format!("sshd could not be started: {error}"))?;
+            match wait_for_banner(port, &mut child).await {
+                Ok(()) => {
+                    return Ok(Self {
+                        port,
+                        client_key_file,
+                        host_key: host_key.public_key().clone(),
+                        user,
+                        directory,
+                        child,
+                    });
+                }
+                Err(reason) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    failures.push(reason);
+                }
             }
-            if let Ok(Some(status)) = child.try_wait() {
-                return Err(format!("sshd exited at once ({status})"));
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let _ = child.kill();
-        let _ = child.wait();
-        Err(format!("sshd did not listen on port {port} within 5s"))
+        Err(format!("sshd did not start: {}", failures.join("; ")))
     }
+}
+
+/// Wait until the sshd `child` answers on `port` with an SSH banner while still running.
+async fn wait_for_banner(port: u16, child: &mut std::process::Child) -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
+    let address: SocketAddr = format!("127.0.0.1:{port}").parse().expect("address");
+    for _ in 0..100 {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!("sshd exited at once ({status})"));
+        }
+        if let Ok(mut stream) = TcpStream::connect(address).await {
+            let mut banner = [0u8; 15];
+            let read =
+                tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut banner)).await;
+            // Another sshd may hold the port while this one is still starting, so this one must
+            // still be running a moment later, when it would have failed to bind.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            return match (read, child.try_wait()) {
+                (Ok(Ok(_)), Ok(None)) if &banner == b"SSH-2.0-OpenSSH" => Ok(()),
+                _ => Err(format!("port {port} did not answer as this sshd")),
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(format!("sshd did not listen on port {port} within 5s"))
 }
 
 impl Drop for Sshd {

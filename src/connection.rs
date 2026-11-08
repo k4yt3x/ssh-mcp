@@ -17,8 +17,12 @@ use russh::{
     client::{self, KeyboardInteractiveAuthResponse},
     kex,
     keys::{
-        PrivateKeyWithHashAlg, decode_secret_key,
-        ssh_key::{Algorithm, Certificate, HashAlg, PrivateKey},
+        PrivateKeyWithHashAlg,
+        agent::AgentIdentity,
+        decode_secret_key,
+        signature::Signer as _,
+        ssh_encoding::Encode,
+        ssh_key::{Algorithm, Certificate, HashAlg, PrivateKey, private::KeypairData},
     },
     mac,
 };
@@ -32,7 +36,7 @@ use crate::{
     host_key::{HostKeyPolicy, HostKeyReport, Verdict, Verification},
     output::{ToolError, format_duration, lock, random_hex},
     paths::{read_small_file, resolve_local_path},
-    sftp::SftpSlot,
+    sftp::SftpState,
     shell::ShellTable,
 };
 
@@ -91,7 +95,7 @@ pub(crate) struct Connection {
     pub(crate) shells: Mutex<ShellTable>,
     pub(crate) forwards: Mutex<ForwardTable>,
     pub(crate) remote_forward_targets: RemoteForwardTargets,
-    pub(crate) sftp: SftpSlot,
+    pub(crate) sftp: SftpState,
     /// Canceled when this connection is closed, which stops its forwards' listeners.
     pub(crate) closed: CancellationToken,
 }
@@ -396,10 +400,14 @@ fn load_private_key(
         Material::File(_) => "private_key_file",
     };
     let text = material.read(argument)?;
-    decode_secret_key(&text, passphrase).map_err(|error| match error {
-        russh::keys::Error::KeyIsEncrypted => ToolError::new(format!(
+    let encrypted = || {
+        ToolError::new(format!(
             "The key in {argument} is encrypted; pass private_key_passphrase."
-        )),
+        ))
+    };
+    decode_secret_key(&text, passphrase).map_err(|error| match error {
+        russh::keys::Error::KeyIsEncrypted => encrypted(),
+        _ if passphrase.is_none() && is_encrypted_key(&text) => encrypted(),
         _ if passphrase.is_some() => ToolError::new(format!(
             "The key in {argument} could not be read: the passphrase may be wrong, or it is not a private key."
         )),
@@ -407,6 +415,16 @@ fn load_private_key(
             "{argument} does not hold a private key in a format this server reads (OpenSSH, PEM or PuTTY)."
         )),
     })
+}
+
+/// Whether key text is an encrypted PuTTY or PKCS#8 key. Their decoders fail on one without a
+/// passphrase as on an unreadable key, while OpenSSH and PKCS#5 keys report the encryption.
+fn is_encrypted_key(text: &str) -> bool {
+    text.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----")
+        || text.lines().any(|line| {
+            line.strip_prefix("Encryption:")
+                .is_some_and(|value| value.trim() != "none")
+        })
 }
 
 fn load_certificate(material: &Material) -> Result<Certificate, ToolError> {
@@ -516,8 +534,9 @@ pub(crate) async fn connect(
         request.accept_new_host_key,
     )?);
 
+    let legacy = request.allow_legacy_algorithms;
     let mut preferred = Preferred::default();
-    if request.allow_legacy_algorithms {
+    if legacy {
         preferred = legacy_preferences(preferred);
     }
     preferred = prefer_checkable_keys(
@@ -563,11 +582,11 @@ pub(crate) async fn connect(
                     })?;
                 client::connect_stream(config, channel.into_stream(), handler)
                     .await
-                    .map_err(|error| handshake_failure(&facts, &target, &error))
+                    .map_err(|error| handshake_failure(&facts, &target, &error, legacy))
             }
             None => client::connect(config, (target.host.as_str(), target.port), handler)
                 .await
-                .map_err(|error| handshake_failure(&facts, &target, &error)),
+                .map_err(|error| handshake_failure(&facts, &target, &error, legacy)),
         }
     };
     let mut handle = tokio::time::timeout(request.connect_timeout, handshake)
@@ -599,6 +618,7 @@ pub(crate) async fn connect(
             key,
             certificate,
             password: request.password.as_deref(),
+            allow_sha1_rsa: legacy,
         }),
     )
     .await
@@ -629,7 +649,7 @@ pub(crate) async fn connect(
         shells: Mutex::new(ShellTable::default()),
         forwards: Mutex::new(ForwardTable::default()),
         remote_forward_targets,
-        sftp: SftpSlot::default(),
+        sftp: SftpState::default(),
         closed: CancellationToken::new(),
     });
     registry.insert(Arc::clone(&connection));
@@ -661,21 +681,30 @@ pub(crate) async fn connect(
 }
 
 /// Describe why the handshake failed, with the host key when the server got far enough to present
-/// one.
+/// one. `legacy` is whether older algorithms were already offered.
 fn handshake_failure(
     facts: &Mutex<HandshakeFacts>,
     target: &Target,
     error: &russh::Error,
+    legacy: bool,
 ) -> ToolError {
     let facts = lock(facts);
     match &facts.host_key {
         Some((report, Verdict::Refused(reason))) => {
             ToolError::new(format!("Host key refused. {reason}\n{}", report.describe()))
         }
-        _ => ToolError::new(format!(
-            "Could not connect to {}:{}: {error}",
-            target.host, target.port
-        )),
+        _ => {
+            let remedy = match error {
+                russh::Error::NoCommonAlgo { .. } if !legacy => {
+                    ". The server may need older algorithms: pass allow_legacy_algorithms."
+                }
+                _ => "",
+            };
+            ToolError::new(format!(
+                "Could not connect to {}:{}: {error}{remedy}",
+                target.host, target.port
+            ))
+        }
     }
 }
 
@@ -739,6 +768,47 @@ struct Credentials<'a> {
     key: Option<Arc<PrivateKey>>,
     certificate: Option<Certificate>,
     password: Option<&'a str>,
+    /// Sign with an RSA key using SHA-1 when the server does not list SHA-2 RSA signatures.
+    allow_sha1_rsa: bool,
+}
+
+/// Signs login requests with the private key a connect was given. A certificate login goes
+/// through it because russh signs one itself only under the SHA-1 RSA name, which OpenSSH 8.8
+/// and later refuse.
+struct KeySigner(Arc<PrivateKey>);
+
+/// Why a login request could not be signed.
+#[derive(Debug)]
+struct SigningError(String);
+
+impl From<russh::SendError> for SigningError {
+    fn from(error: russh::SendError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+impl russh::Signer for KeySigner {
+    type Error = SigningError;
+
+    async fn auth_sign(
+        &mut self,
+        _identity: &AgentIdentity,
+        hash: Option<HashAlg>,
+        mut to_sign: Vec<u8>,
+    ) -> Result<Vec<u8>, SigningError> {
+        let failed = |error: &dyn std::fmt::Display| SigningError(error.to_string());
+        let signature = match self.0.key_data() {
+            KeypairData::Rsa(keypair) => (keypair, hash).try_sign(&to_sign),
+            keypair => keypair.try_sign(&to_sign),
+        }
+        .map_err(|error| failed(&error))?;
+        let mut blob = Vec::new();
+        signature
+            .encode(&mut blob)
+            .map_err(|error| failed(&error))?;
+        blob.encode(&mut to_sign).map_err(|error| failed(&error))?;
+        Ok(to_sign)
+    }
 }
 
 /// Log in with what was given. Each round tries a method the server offers at that point and
@@ -788,32 +858,50 @@ async fn authenticate(
                 let Some(key) = &credentials.key else {
                     continue;
                 };
+                let is_rsa = key.algorithm().is_rsa();
+                // The best SHA-2 hash the server lists for RSA signatures, if it lists one.
+                let listed_sha2 = if is_rsa {
+                    handle
+                        .best_supported_rsa_hash()
+                        .await
+                        .map_err(failed)?
+                        .flatten()
+                } else {
+                    None
+                };
+                // SHA-1 (no hash) only when allowed: a server that lists no SHA-2 RSA signatures
+                // may still take them.
+                let hash = match listed_sha2 {
+                    Some(hash) => Some(hash),
+                    None if !is_rsa || credentials.allow_sha1_rsa => None,
+                    None => Some(HashAlg::Sha256),
+                };
                 let result = match credentials.certificate.clone() {
                     Some(certificate) => handle
-                        .authenticate_openssh_cert(user, Arc::clone(key), certificate)
+                        .authenticate_certificate_with(
+                            user,
+                            certificate,
+                            hash,
+                            &mut KeySigner(Arc::clone(key)),
+                        )
+                        .await
+                        .map_err(|error| {
+                            ToolError::new(format!("Signing the login failed: {}", error.0))
+                        })?,
+                    None => handle
+                        .authenticate_publickey(
+                            user,
+                            PrivateKeyWithHashAlg::new(Arc::clone(key), hash),
+                        )
                         .await
                         .map_err(failed)?,
-                    None => {
-                        let hash = if key.algorithm().is_rsa() {
-                            handle
-                                .best_supported_rsa_hash()
-                                .await
-                                .map_err(failed)?
-                                .flatten()
-                                .or(Some(HashAlg::Sha256))
-                        } else {
-                            None
-                        };
-                        handle
-                            .authenticate_publickey(
-                                user,
-                                PrivateKeyWithHashAlg::new(Arc::clone(key), hash),
-                            )
-                            .await
-                            .map_err(failed)?
-                    }
                 };
-                Attempt::from_result(result, method, "the key was not accepted")
+                let rejected = if is_rsa && listed_sha2.is_none() && !credentials.allow_sha1_rsa {
+                    "the key was not accepted; the server does not list SHA-2 RSA signatures, so it may need allow_legacy_algorithms"
+                } else {
+                    "the key was not accepted"
+                };
+                Attempt::from_result(result, method, rejected)
             }
             Method::Password => {
                 let Some(password) = credentials.password else {
@@ -1002,6 +1090,19 @@ mod tests {
             "{wrong}"
         );
         assert!(load_private_key(&material, Some("correct passphrase")).is_ok());
+        let pkcs8 = directory.path().join("pkcs8");
+        let generated = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ecdsa", "-m", "PKCS8", "-N", "secret", "-f"])
+            .arg(&pkcs8)
+            .status();
+        assert!(generated.is_ok_and(|status| status.success()));
+        let pkcs8 = Material::File(pkcs8.display().to_string());
+        let missing = load_private_key(&pkcs8, None).unwrap_err();
+        assert!(
+            missing.message().contains("pass private_key_passphrase"),
+            "{missing}"
+        );
+        assert!(load_private_key(&pkcs8, Some("secret")).is_ok());
         let not_a_key = Material::Content("not a key".to_owned());
         let refused = load_private_key(&not_a_key, None).unwrap_err();
         assert!(

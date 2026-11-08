@@ -1,6 +1,6 @@
 [package]
 name = "ssh-mcp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -35,6 +35,9 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 vt100 = "0.18"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 rmcp = { version = "3.9", features = ["client", "transport-async-rw"] }

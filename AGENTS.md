@@ -44,6 +44,8 @@ agent's facts (keys, passwords, expected host keys) arrive as tool arguments.
 - Written for users: what they will see, break on or must do, one line per entry under 100
   characters. No internal names or module paths. Breaking changes get an inline `**Breaking:**`
   prefix.
+- Short enough to read: not a commit log. Group related fixes into one entry, and leave out wording
+  tweaks and fixes nobody would notice.
 - A release is a tag named by the bare version (`0.1.0`, no `v`). Before tagging, set the version in
   `Cargo.toml` (and `Cargo.lock`), move `[Unreleased]` under `## [<version>] - <date>`, and update
   the compare links at the end. The release workflow drafts the GitHub release from that section
@@ -152,7 +154,9 @@ the exception, and stops its command, since nothing could read its output later.
 server (channel opens and requests, writes, signals, closes, SFTP requests) has a timeout or watches
 the call's cancellation: russh queues every send behind the connection's outgoing data, so one
 stalled connection would otherwise hold a call forever. `client::bounded` and
-`client::best_effort` wrap the sends.
+`client::best_effort` wrap the sends. The file tools call `sftp::stop_if_canceled` before every
+change they make, so a canceled transfer or write stops at the next file, folder or rename, and the
+forward tools check before they keep a forward open.
 
 ## Tests
 

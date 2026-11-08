@@ -15,13 +15,24 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    client::{REQUEST_TIMEOUT, SshHandle, bounded, open_session_channel},
+    client::{
+        CLOSE_TIMEOUT, REQUEST_TIMEOUT, SshHandle, best_effort, bounded, open_session_channel,
+    },
     output::{Progress, ToolError, floor_char_boundary, format_duration, format_size, random_hex},
-    paths::resolve_local_path,
+    paths::{open_regular_file, resolve_local_path},
 };
 
-/// The SFTP session of one connection, opened on first use.
-pub(crate) type SftpSlot = tokio::sync::Mutex<Option<Arc<SftpSession>>>;
+/// The SFTP session of one connection, opened on first use, and the lock that keeps the text file
+/// tools from interleaving on it.
+#[derive(Default)]
+pub(crate) struct SftpState {
+    session: tokio::sync::Mutex<Option<Arc<SftpSession>>>,
+    /// Held shared by `read_file` and exclusively by `write_file` and `edit_file`. An edit reads
+    /// the file and writes it back, so a write in between would be lost, and a write truncates the
+    /// file before it writes, so a read in between would see part of it. Waiting for it needs no
+    /// timeout: whoever holds it waits only on bounded SFTP requests.
+    text_files: tokio::sync::RwLock<()>,
+}
 
 /// The largest file `read_file` and `edit_file` read whole.
 const MAX_TEXT_FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -49,6 +60,16 @@ fn canceled() -> ToolError {
     ToolError::new("The call was canceled.")
 }
 
+/// Stop a call its client canceled before it changes anything more. The client drops the result
+/// unread, so a change made after the cancellation is one nobody is told about.
+fn stop_if_canceled(cancel: &CancellationToken) -> Result<(), ToolError> {
+    if cancel.is_cancelled() {
+        Err(canceled())
+    } else {
+        Ok(())
+    }
+}
+
 fn sftp_config() -> Config {
     Config {
         request_timeout_secs: SFTP_REQUEST_TIMEOUT.as_secs(),
@@ -56,19 +77,38 @@ fn sftp_config() -> Config {
     }
 }
 
-/// Open a channel running the server's SFTP subsystem.
+/// Open a channel running the server's SFTP subsystem. The server's answer to the request is
+/// read first: a server without SFTP refuses it and leaves the channel open, and the SFTP session
+/// would wait for an answer to its first request until its timeout.
 async fn open_sftp_channel(
     handle: &SshHandle,
     cancel: &CancellationToken,
 ) -> Result<russh::ChannelStream<russh::client::Msg>, ToolError> {
-    let channel = open_session_channel(handle, cancel).await?;
+    let mut channel = open_session_channel(handle, cancel).await?;
     bounded(
         REQUEST_TIMEOUT,
         "request SFTP",
         channel.request_subsystem(true, "sftp"),
     )
     .await?;
-    Ok(channel.into_stream())
+    let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+    let failure = loop {
+        let message = tokio::select! {
+            message = channel.wait() => message,
+            () = tokio::time::sleep_until(deadline) => break sftp_unavailable("no answer"),
+            () = cancel.cancelled() => break canceled(),
+        };
+        match message {
+            Some(russh::ChannelMsg::Success) => return Ok(channel.into_stream()),
+            Some(russh::ChannelMsg::Failure) => break sftp_unavailable("the request was refused"),
+            Some(russh::ChannelMsg::Close) | None => {
+                break sftp_unavailable("the channel was closed");
+            }
+            Some(_) => {}
+        }
+    };
+    best_effort(CLOSE_TIMEOUT, "closing the SFTP channel", channel.close()).await;
+    Err(failure)
 }
 
 fn sftp_unavailable(error: impl std::fmt::Display) -> ToolError {
@@ -80,11 +120,11 @@ fn sftp_unavailable(error: impl std::fmt::Display) -> ToolError {
 /// Open the connection's SFTP session, or return the one already open.
 pub(crate) async fn session(
     handle: &SshHandle,
-    slot: &SftpSlot,
+    state: &SftpState,
     cancel: &CancellationToken,
 ) -> Result<Arc<SftpSession>, ToolError> {
     let mut slot = tokio::select! {
-        slot = slot.lock() => slot,
+        slot = state.session.lock() => slot,
         () = cancel.cancelled() => return Err(canceled()),
     };
     if let Some(session) = slot.as_ref() {
@@ -105,13 +145,10 @@ pub(crate) async fn session(
 /// A remote path as SFTP understands it: `~/x` and `~` are relative to the login directory, which
 /// is where SFTP resolves relative paths.
 fn remote_path(path: &str) -> String {
-    if path == "~" {
-        ".".to_owned()
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        rest.to_owned()
-    } else {
-        path.to_owned()
+    if path == "~" || path == "~/" {
+        return ".".to_owned();
     }
+    path.strip_prefix("~/").unwrap_or(path).to_owned()
 }
 
 fn join_remote(parent: &str, name: &str) -> String {
@@ -138,18 +175,46 @@ fn local_join(root: &Path, relative: &[String]) -> PathBuf {
         .fold(root.to_path_buf(), |path, part| path.join(part))
 }
 
-fn sftp_failure(action: &str, path: &str, error: impl std::fmt::Display) -> ToolError {
-    ToolError::new(format!("Could not {action} {path}: {error}"))
+/// An error from the SFTP session, as the reason a result gives.
+trait SftpReason {
+    fn reason(&self) -> String;
+}
+
+impl SftpReason for SftpError {
+    /// The server's message, or the status's name when the server sent none. The library's own
+    /// text joins the two, which reads "No such file: No such file".
+    fn reason(&self) -> String {
+        match self {
+            SftpError::Status(status) if status.error_message.trim().is_empty() => {
+                status.status_code.to_string()
+            }
+            SftpError::Status(status) => status.error_message.trim().to_owned(),
+            other => other.to_string(),
+        }
+    }
+}
+
+impl SftpReason for std::io::Error {
+    /// Reading and writing a remote file report some SFTP errors wrapped whole in I/O errors, and
+    /// others as only the server's message, which may be empty.
+    fn reason(&self) -> String {
+        match self
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<SftpError>())
+        {
+            Some(error) => error.reason(),
+            None if self.to_string().trim().is_empty() => "the server gave no reason".to_owned(),
+            None => self.to_string(),
+        }
+    }
+}
+
+fn sftp_failure(action: &str, path: &str, error: impl SftpReason) -> ToolError {
+    ToolError::new(format!("Could not {action} {path}: {}", error.reason()))
 }
 
 fn local_failure(action: &str, path: &Path, error: impl std::fmt::Display) -> ToolError {
     ToolError::new(format!("{} could not be {action}: {error}", path.display()))
-}
-
-/// The type of a remote entry. The type bits are compared whole: a socket or a block device
-/// shares a bit with a folder.
-fn kind(metadata: &Metadata) -> FileType {
-    metadata.file_type()
 }
 
 /// What exists at a remote path, without following a final symlink, or `None` when nothing does.
@@ -162,6 +227,24 @@ async fn remote_entry(session: &SftpSession, path: &str) -> Result<Option<Metada
     }
 }
 
+/// Refuse to create `path` on the server when the folder it would go in is missing or is not a
+/// folder. SFTP's own refusal does not say which part of the path is wrong.
+async fn require_remote_parent(session: &SftpSession, path: &str) -> Result<(), ToolError> {
+    let (parent, _) = split_remote(path);
+    match session.metadata(parent.as_str()).await {
+        Ok(metadata) if metadata.file_type() == FileType::Dir => Ok(()),
+        Ok(_) => Err(ToolError::new(format!(
+            "{parent} on the server is not a folder."
+        ))),
+        Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => {
+            Err(ToolError::new(format!(
+                "The folder {parent} does not exist on the server; create it first, such as with exec and mkdir -p."
+            )))
+        }
+        Err(error) => Err(sftp_failure("check", &parent, error)),
+    }
+}
+
 /// What exists at a local path, without following a final symlink, or `None` when nothing does.
 fn local_entry(path: &Path) -> Result<Option<std::fs::Metadata>, ToolError> {
     match std::fs::symlink_metadata(path) {
@@ -171,21 +254,26 @@ fn local_entry(path: &Path) -> Result<Option<std::fs::Metadata>, ToolError> {
     }
 }
 
+/// Refuse a remote path the text file tools cannot use: a folder, or anything else that is not a
+/// regular file, such as a pipe, which would block the server's SFTP process until something
+/// opens its other end. `instead` is what exec would do with it, such as "read it".
+fn require_regular_file(metadata: &Metadata, path: &str, instead: &str) -> Result<(), ToolError> {
+    match metadata.file_type() {
+        FileType::File => Ok(()),
+        FileType::Dir => Err(ToolError::new(format!("{path} is a folder."))),
+        _ => Err(ToolError::new(format!(
+            "{path} is not a regular file; use exec to {instead}."
+        ))),
+    }
+}
+
 /// Read a remote text file whole, refusing folders, huge files and binary content.
 async fn read_text(session: &SftpSession, path: &str) -> Result<String, ToolError> {
     let metadata = session
         .metadata(path)
         .await
         .map_err(|error| sftp_failure("read", path, error))?;
-    match kind(&metadata) {
-        FileType::File => {}
-        FileType::Dir => return Err(ToolError::new(format!("{path} is a directory."))),
-        _ => {
-            return Err(ToolError::new(format!(
-                "{path} is not a regular file; use exec to read it."
-            )));
-        }
-    }
+    require_regular_file(&metadata, path, "read it")?;
     let too_large = || {
         ToolError::new(format!(
             "{path} is larger than {}, too large to read as text; use download, or exec with head, tail or grep.",
@@ -251,11 +339,17 @@ pub(crate) struct ReadRequest {
 
 /// Read lines of a remote text file.
 pub(crate) async fn read_file(
+    state: &SftpState,
     session: &SftpSession,
     request: ReadRequest,
+    cancel: &CancellationToken,
 ) -> Result<String, ToolError> {
     let path = remote_path(&request.path);
-    let text = read_text(session, &path).await?;
+    let text = {
+        let _reading = state.text_files.read().await;
+        stop_if_canceled(cancel)?;
+        read_text(session, &path).await?
+    };
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let total = lines.len();
     if total == 0 {
@@ -308,15 +402,26 @@ pub(crate) async fn read_file(
 
 /// Create or replace a remote text file.
 pub(crate) async fn write_file(
+    state: &SftpState,
     session: &SftpSession,
     path: &str,
     content: &str,
+    cancel: &CancellationToken,
 ) -> Result<String, ToolError> {
     let path = remote_path(path);
-    let existed = session
-        .try_exists(path.as_str())
-        .await
-        .map_err(|error| sftp_failure("check", &path, error))?;
+    let _writing = state.text_files.write().await;
+    let existed = match session.metadata(path.as_str()).await {
+        Ok(metadata) => {
+            require_regular_file(&metadata, &path, "write to it")?;
+            true
+        }
+        Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => false,
+        Err(error) => return Err(sftp_failure("check", &path, error)),
+    };
+    if !existed {
+        require_remote_parent(session, &path).await?;
+    }
+    stop_if_canceled(cancel)?;
     write_text(session, &path, content).await?;
     let verb = if existed { "Replaced" } else { "Created" };
     Ok(format!(
@@ -335,8 +440,10 @@ pub(crate) struct EditRequest {
 
 /// Replace text in a remote file.
 pub(crate) async fn edit_file(
+    state: &SftpState,
     session: &SftpSession,
     request: EditRequest,
+    cancel: &CancellationToken,
 ) -> Result<String, ToolError> {
     let path = remote_path(&request.path);
     if request.old_string.is_empty() {
@@ -347,9 +454,19 @@ pub(crate) async fn edit_file(
     if request.old_string == request.new_string {
         return Err(ToolError::new("old_string and new_string are the same."));
     }
+    let _writing = state.text_files.write().await;
     let text = read_text(session, &path).await?;
     let count = text.matches(&request.old_string).count();
     if count == 0 {
+        // A line ending's carriage return is invisible in what read_file returns.
+        if text.contains("\r\n")
+            && request.old_string.contains('\n')
+            && !request.old_string.contains('\r')
+        {
+            return Err(ToolError::new(format!(
+                "old_string was not found in {path}, whose lines end in \\r\\n. Write each line break in old_string and new_string as \\r\\n."
+            )));
+        }
         return Err(ToolError::new(format!(
             "old_string was not found in {path}. It must match exactly, including whitespace."
         )));
@@ -364,6 +481,7 @@ pub(crate) async fn edit_file(
     } else {
         text.replacen(&request.old_string, &request.new_string, 1)
     };
+    stop_if_canceled(cancel)?;
     write_text(session, &path, &edited).await?;
     let places = if count == 1 {
         "1 place".to_owned()
@@ -438,9 +556,7 @@ struct TransferProgress<'a> {
 
 impl TransferProgress<'_> {
     async fn advance(&mut self, bytes: u64, name: &str) -> Result<(), ToolError> {
-        if self.cancel.is_cancelled() {
-            return Err(ToolError::new("The transfer was canceled."));
-        }
+        stop_if_canceled(self.cancel)?;
         self.done += bytes;
         self.progress
             .report_amount(
@@ -498,13 +614,22 @@ pub(crate) async fn upload(
     let metadata = tokio::fs::metadata(&local)
         .await
         .map_err(|error| local_failure("read", &local, error))?;
+    if !metadata.is_dir() && !metadata.is_file() {
+        return Err(ToolError::new(format!(
+            "{} is not a regular file or a folder.",
+            local.display()
+        )));
+    }
     let existing = remote_entry(session, &destination).await?;
     if existing.is_some() && !request.overwrite {
         return Err(ToolError::new(format!(
             "{destination} already exists on the server; pass overwrite to replace it."
         )));
     }
-    let existing_kind = existing.as_ref().map(kind);
+    if existing.is_none() {
+        require_remote_parent(session, &destination).await?;
+    }
+    let existing_kind = existing.as_ref().map(Metadata::file_type);
     let mut tally = Tally::default();
     if metadata.is_dir() {
         if request.mode.is_some() {
@@ -536,6 +661,7 @@ pub(crate) async fn upload(
             total,
         };
         if existing.is_none() {
+            stop_if_canceled(cancel)?;
             session
                 .create_dir(destination.as_str())
                 .await
@@ -543,13 +669,21 @@ pub(crate) async fn upload(
             tally.directories += 1;
         }
         // Folder permissions are set after their contents are written, so a read-only folder
-        // does not refuse its own files.
-        let mut folder_modes = vec![(destination.clone(), local_mode(&metadata))];
+        // does not refuse its own files. Folders that already existed keep theirs.
+        let mut folder_modes = Vec::new();
+        if existing.is_none() {
+            folder_modes.push((destination.clone(), local_mode(&metadata)));
+        }
         for entry in entries {
+            stop_if_canceled(cancel)?;
             match entry {
                 LocalEntry::Directory { relative, mode } => {
                     let path = join_remote(&destination, &relative.join("/"));
-                    match remote_entry(session, &path).await?.as_ref().map(kind) {
+                    match remote_entry(session, &path)
+                        .await?
+                        .as_ref()
+                        .map(Metadata::file_type)
+                    {
                         Some(FileType::Dir) => {}
                         Some(_) => {
                             session
@@ -560,13 +694,16 @@ pub(crate) async fn upload(
                                 .create_dir(path.as_str())
                                 .await
                                 .map_err(|error| sftp_failure("create", &path, error))?;
+                            folder_modes.push((path, mode));
                         }
-                        None => session
-                            .create_dir(path.as_str())
-                            .await
-                            .map_err(|error| sftp_failure("create", &path, error))?,
+                        None => {
+                            session
+                                .create_dir(path.as_str())
+                                .await
+                                .map_err(|error| sftp_failure("create", &path, error))?;
+                            folder_modes.push((path, mode));
+                        }
                     }
-                    folder_modes.push((path, mode));
                     tally.directories += 1;
                 }
                 LocalEntry::File {
@@ -578,9 +715,12 @@ pub(crate) async fn upload(
                     let path = join_remote(&destination, &relative.join("/"));
                     tally.bytes += upload_file(
                         session,
-                        &source,
+                        LocalFile {
+                            path: &source,
+                            follow_symlink: false,
+                        },
                         &path,
-                        mode,
+                        UploadMode::Kept(mode),
                         request.overwrite,
                         &mut transfer,
                     )
@@ -607,7 +747,8 @@ pub(crate) async fn upload(
         }
         // Deepest first, so no folder loses write permission before the folders inside it.
         for (path, mode) in folder_modes.iter().rev() {
-            set_remote_mode(session, path, *mode).await;
+            stop_if_canceled(cancel)?;
+            keep_remote_mode(session, path, *mode).await;
         }
     } else {
         if existing_kind == Some(FileType::Dir) {
@@ -615,7 +756,10 @@ pub(crate) async fn upload(
                 "{destination} is a folder on the server; give the full path of the file to write."
             )));
         }
-        let mode = request.mode.unwrap_or_else(|| local_mode(&metadata));
+        let mode = match request.mode {
+            Some(mode) => UploadMode::Requested(mode),
+            None => UploadMode::Kept(local_mode(&metadata)),
+        };
         let mut transfer = TransferProgress {
             progress,
             cancel,
@@ -624,7 +768,10 @@ pub(crate) async fn upload(
         };
         tally.bytes = upload_file(
             session,
-            &local,
+            LocalFile {
+                path: &local,
+                follow_symlink: true,
+            },
             &destination,
             mode,
             existing.is_some(),
@@ -641,33 +788,68 @@ pub(crate) async fn upload(
     ))
 }
 
+/// A local file to upload.
+struct LocalFile<'a> {
+    path: &'a Path,
+    /// Whether a symlink at `path` is followed. An entry of a folder is not: the folder was listed
+    /// with its symlinks kept as symlinks, so one found at a file's name was put there since.
+    follow_symlink: bool,
+}
+
+/// The permissions an uploaded file gets.
+#[derive(Clone, Copy)]
+enum UploadMode {
+    /// The local file's, kept when the server allows it.
+    Kept(u32),
+    /// The ones the caller asked for; the upload fails without them.
+    Requested(u32),
+}
+
 /// Upload one file to a temporary name beside `destination`, then rename it into place, so an
 /// interrupted upload never leaves a partial file under the destination name. `replace` allows an
 /// existing file at `destination` to be replaced.
 async fn upload_file(
     session: &SftpSession,
-    source: &Path,
+    source: LocalFile<'_>,
     destination: &str,
-    mode: u32,
+    mode: UploadMode,
     replace: bool,
     transfer: &mut TransferProgress<'_>,
 ) -> Result<u64, ToolError> {
+    let LocalFile {
+        path: source,
+        follow_symlink,
+    } = source;
     let (parent, name) = split_remote(destination);
     let temporary = join_remote(
         &parent,
         &format!(".{name}.ssh-mcp-{}.partial", random_hex(4)?),
     );
+    let opened = tokio::task::spawn_blocking({
+        let source = source.to_path_buf();
+        move || open_regular_file(&source, follow_symlink)
+    })
+    .await
+    .map_err(|error| ToolError::new(format!("Opening the file failed: {error}")))?;
+    let mut local = match opened {
+        Ok(Some(file)) => tokio::fs::File::from_std(file),
+        Ok(None) => {
+            return Err(ToolError::new(format!(
+                "{} is not a regular file.",
+                source.display()
+            )));
+        }
+        Err(error) => return Err(local_failure("read", source, error)),
+    };
+    stop_if_canceled(transfer.cancel)?;
     // Set when the destination was removed but the new file could not take its place, so the
     // temporary file is the only copy left and must be kept.
     let mut keep_temporary = false;
     let result = async {
-        let mut local = tokio::fs::File::open(source)
-            .await
-            .map_err(|error| local_failure("read", source, error))?;
         let mut remote = session
             .open_with_flags(
                 temporary.as_str(),
-                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE,
             )
             .await
             .map_err(|error| sftp_failure("create", &temporary, error))?;
@@ -692,7 +874,13 @@ async fn upload_file(
             .shutdown()
             .await
             .map_err(|error| sftp_failure("finish writing", destination, error))?;
-        set_remote_mode(session, &temporary, mode).await;
+        match mode {
+            UploadMode::Kept(mode) => keep_remote_mode(session, &temporary, mode).await,
+            UploadMode::Requested(mode) => set_remote_mode(session, &temporary, mode)
+                .await
+                .map_err(|error| sftp_failure("set the permissions of", destination, error))?,
+        }
+        stop_if_canceled(transfer.cancel)?;
         if let Err(error) = session.rename(temporary.as_str(), destination).await {
             // A rename whose answer was lost to a timeout may still have happened.
             if remote_entry(session, &temporary).await?.is_none() {
@@ -703,6 +891,7 @@ async fn upload_file(
             if !replace || remote_entry(session, destination).await?.is_none() {
                 return Err(sftp_failure("move into place", destination, error));
             }
+            stop_if_canceled(transfer.cancel)?;
             session
                 .remove_file(destination)
                 .await
@@ -713,7 +902,8 @@ async fn upload_file(
                 }
                 keep_temporary = true;
                 return Err(ToolError::new(format!(
-                    "{destination} was removed to be replaced, but the new file could not be moved into its place ({error}); the new file is kept at {temporary}."
+                    "{destination} was removed to be replaced, but the new file could not be moved into its place ({}); the new file is kept at {temporary}.",
+                    error.reason()
                 )));
             }
         }
@@ -729,10 +919,16 @@ async fn upload_file(
     result
 }
 
-async fn set_remote_mode(session: &SftpSession, path: &str, mode: u32) {
+async fn set_remote_mode(session: &SftpSession, path: &str, mode: u32) -> Result<(), SftpError> {
     let mut attributes = FileAttributes::empty();
     attributes.permissions = Some(mode & 0o7777);
-    if let Err(error) = session.set_metadata(path, attributes).await {
+    session.set_metadata(path, attributes).await
+}
+
+/// Give a remote file or folder the permissions of what it was copied from where the server
+/// allows it; some servers do not let permissions be set, and the copy is still made.
+async fn keep_remote_mode(session: &SftpSession, path: &str, mode: u32) {
+    if let Err(error) = set_remote_mode(session, path, mode).await {
         tracing::debug!("permissions of {path} could not be set: {error}");
     }
 }
@@ -766,17 +962,29 @@ fn walk_local(root: &Path) -> Result<(Vec<LocalEntry>, u64), ToolError> {
         children.sort_by_key(std::fs::DirEntry::file_name);
         for child in children {
             let path = child.path();
-            let name = child.file_name().to_string_lossy().into_owned();
+            let not_utf8 = || {
+                ToolError::new(format!(
+                    "{} has a name or target that is not UTF-8, which SFTP paths here cannot carry, so nothing was uploaded. Rename it, or pack the folder with tar and upload the archive.",
+                    path.display()
+                ))
+            };
+            let name = child.file_name().into_string().map_err(|_| not_utf8())?;
             let mut child_relative = relative.clone();
             child_relative.push(name);
             let metadata = std::fs::symlink_metadata(&path)
                 .map_err(|error| local_failure("read", &path, error))?;
             if metadata.file_type().is_symlink() {
                 let target = std::fs::read_link(&path)
-                    .map_err(|error| local_failure("read", &path, error))?;
+                    .map_err(|error| local_failure("read", &path, error))?
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| not_utf8())?;
+                // A Windows link target uses backslashes; on Unix a backslash is part of a name.
+                #[cfg(windows)]
+                let target = target.replace('\\', "/");
                 entries.push(LocalEntry::Symlink {
                     relative: child_relative,
-                    target: target.to_string_lossy().replace('\\', "/"),
+                    target,
                 });
             } else if metadata.is_dir() {
                 entries.push(LocalEntry::Directory {
@@ -855,7 +1063,7 @@ pub(crate) async fn download(
         )));
     }
     let mut tally = Tally::default();
-    match kind(&metadata) {
+    match metadata.file_type() {
         FileType::Dir => {
             if existing.as_ref().is_some_and(|metadata| !metadata.is_dir()) {
                 return Err(ToolError::new(format!(
@@ -882,13 +1090,18 @@ pub(crate) async fn download(
                 total,
             };
             if existing.is_none() {
+                stop_if_canceled(cancel)?;
                 create_local_directory(&local)?;
                 tally.directories += 1;
             }
             // Folder permissions are set after their contents are written, so a read-only
-            // folder does not refuse its own files.
-            let mut folder_modes = vec![(local.clone(), metadata.permissions)];
+            // folder does not refuse its own files. Folders that already existed keep theirs.
+            let mut folder_modes = Vec::new();
+            if existing.is_none() {
+                folder_modes.push((local.clone(), metadata.permissions));
+            }
             for entry in entries {
+                stop_if_canceled(cancel)?;
                 match entry {
                     RemoteEntry::Directory { relative, mode } => {
                         let path = local_join(&local, &relative);
@@ -898,10 +1111,13 @@ pub(crate) async fn download(
                                 std::fs::remove_file(&path)
                                     .map_err(|error| local_failure("replaced", &path, error))?;
                                 create_local_directory(&path)?;
+                                folder_modes.push((path, mode));
                             }
-                            None => create_local_directory(&path)?,
+                            None => {
+                                create_local_directory(&path)?;
+                                folder_modes.push((path, mode));
+                            }
                         }
-                        folder_modes.push((path, mode));
                         tally.directories += 1;
                     }
                     RemoteEntry::File {
@@ -931,6 +1147,7 @@ pub(crate) async fn download(
             }
             // Deepest first, so no folder loses write permission before the folders inside it.
             for (path, mode) in folder_modes.iter().rev() {
+                stop_if_canceled(cancel)?;
                 set_local_mode(path, *mode);
             }
         }
@@ -1019,7 +1236,7 @@ async fn list_folder(
     let listed = loop {
         let reply = tokio::select! {
             reply = lister.readdir(handle.as_str()) => reply,
-            () = cancel.cancelled() => break Err(ToolError::new("The transfer was canceled.")),
+            () = cancel.cancelled() => break Err(canceled()),
         };
         match reply {
             Ok(name) => {
@@ -1082,7 +1299,7 @@ async fn walk_remote(
             }
             let mut child_relative = relative.clone();
             child_relative.push(name);
-            match kind(&metadata) {
+            match metadata.file_type() {
                 FileType::Symlink => {
                     let path = join_remote(root, &child_relative.join("/"));
                     let target = session
@@ -1134,6 +1351,7 @@ async fn download_file(
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
+    stop_if_canceled(transfer.cancel)?;
     let mut local = options
         .open(&temporary)
         .await
@@ -1165,11 +1383,9 @@ async fn download_file(
             .await
             .map_err(|error| local_failure("written", &temporary, error))?;
         drop(local);
+        stop_if_canceled(transfer.cancel)?;
         set_local_mode(&temporary, mode);
-        if cfg!(windows) && destination.exists() {
-            std::fs::remove_file(destination)
-                .map_err(|error| local_failure("replaced", destination, error))?;
-        }
+        // Replaces an existing file, on Windows as well.
         std::fs::rename(&temporary, destination)
             .map_err(|error| local_failure("moved into place", destination, error))?;
         Ok(copied)
@@ -1235,6 +1451,7 @@ mod tests {
     #[test]
     fn a_tilde_path_is_relative_to_the_login_directory() {
         assert_eq!(remote_path("~"), ".");
+        assert_eq!(remote_path("~/"), ".");
         assert_eq!(remote_path("~/notes.txt"), "notes.txt");
         assert_eq!(remote_path("/etc/hosts"), "/etc/hosts");
     }
@@ -1303,7 +1520,7 @@ mod tests {
             (0o010_644, FileType::Other),
         ] {
             attributes.permissions = Some(bits);
-            assert_eq!(kind(&attributes), expected, "{bits:o}");
+            assert_eq!(attributes.file_type(), expected, "{bits:o}");
         }
     }
 

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-08
+
+### Changed
+
+- Managed shells save no history and skip prompt and command hooks, such as atuin's.
+- Merging a folder with `overwrite` keeps the permissions of folders that already exist.
+- `allow_legacy_algorithms` also lets RSA keys log in to servers that only take SHA-1.
+
+### Fixed
+
+- Commands containing `!` work in managed bash and zsh shells.
+- Managed mode works on servers that make `HISTFILE` read-only.
+- RSA certificate logins work against OpenSSH 8.8 and later.
+- `upload` and `write_file` refuse pipes and devices instead of hanging.
+- Edits sent together on one connection no longer overwrite each other.
+- A canceled transfer, file edit or forward makes no further changes.
+- A server without SFTP is reported at once instead of after two minutes.
+- `exec` keeps output that arrives after the exit status and no longer misreports timeouts.
+- Errors for missing folders, CRLF files, encrypted keys and SFTP failures say how to fix them.
+
+### Security
+
+- A host key no longer passes as new when known_hosts has tab-separated or unreadable lines.
+- A private key passed by mistake as `private_key_file` is no longer quoted back in errors.
+
 ## [0.1.0] - 2026-11-08
 
 ### Added
@@ -21,5 +46,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SFTP tools to read, write, edit, upload and download files; `--disable-sftp` removes them.
 - Local, remote and dynamic (SOCKS5) port forwarding, each enabled by its own flag.
 
-[Unreleased]: https://github.com/k4yt3x/ssh-mcp/compare/0.1.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/ssh-mcp/compare/0.1.1...HEAD
+[0.1.1]: https://github.com/k4yt3x/ssh-mcp/compare/0.1.0...0.1.1
 [0.1.0]: https://github.com/k4yt3x/ssh-mcp/releases/tag/0.1.0

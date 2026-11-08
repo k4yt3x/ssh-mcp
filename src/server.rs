@@ -136,6 +136,7 @@ struct ConnectArguments {
     /// Seconds without a tool call before the connection closes; 0 keeps it open. Default 3600.
     idle_timeout_seconds: Option<u64>,
     /// Seconds allowed for connecting and for logging in, each. Default 15.
+    #[schemars(extend("exclusiveMinimum" = 0))]
     connect_timeout_seconds: Option<f64>,
 }
 
@@ -157,9 +158,11 @@ struct ExecArguments {
     /// once.
     stdin: Option<String>,
     /// Default 30.
+    #[schemars(range(min = 0))]
     timeout_seconds: Option<f64>,
     /// The most bytes of each stream to return; beyond it, the start and end are kept. Default
     /// 65536.
+    #[schemars(range(min = 1))]
     max_output_bytes: Option<usize>,
 }
 
@@ -173,8 +176,10 @@ struct ShellOpenArguments {
     /// Leave the terminal as the program sets it up: no prompt detection or exit codes.
     raw: Option<bool>,
     /// Terminal width. Default 200.
+    #[schemars(range(min = 1, max = shell::MAX_TERMINAL_SIDE))]
     columns: Option<u16>,
     /// Terminal height. Default 50.
+    #[schemars(range(min = 1, max = shell::MAX_TERMINAL_SIDE))]
     rows: Option<u16>,
 }
 
@@ -188,8 +193,11 @@ struct ShellRunArguments {
     /// Command to run; may span several lines.
     command: String,
     /// Seconds to wait for it to finish before returning `still running`. Default 30.
+    #[schemars(range(min = 0))]
     wait_seconds: Option<f64>,
-    /// The most output to return; the rest waits for shell_read. Default 65536.
+    /// The most output to return; the rest of the stream waits for shell_read, and a screen is
+    /// cut to fit. Default 65536.
+    #[schemars(range(min = 1))]
     max_output_bytes: Option<usize>,
 }
 
@@ -208,8 +216,11 @@ struct ShellSendArguments {
     /// Regex to wait for in the output that follows the input.
     until: Option<String>,
     /// Most seconds to wait. Default 10.
+    #[schemars(range(min = 0))]
     wait_seconds: Option<f64>,
-    /// The most output to return; the rest waits for shell_read. Default 65536.
+    /// The most output to return; the rest of the stream waits for shell_read, and a screen is
+    /// cut to fit. Default 65536.
+    #[schemars(range(min = 1))]
     max_output_bytes: Option<usize>,
 }
 
@@ -233,11 +244,14 @@ struct ShellReadArguments {
     until: Option<String>,
     /// Most seconds to wait for the running command to finish, until to match, or new output to
     /// settle. Default 0: return at once.
+    #[schemars(range(min = 0))]
     wait_seconds: Option<f64>,
     /// `stream`: new output as text. `screen`: the rendered terminal. `auto` (default): the screen
     /// while a full-screen program runs, the stream otherwise.
     view: Option<ViewArgument>,
-    /// The most output to return; the rest waits for the next read. Default 65536.
+    /// The most output to return; the rest of the stream waits for the next read, and a screen is
+    /// cut to fit. Default 65536.
+    #[schemars(range(min = 1))]
     max_output_bytes: Option<usize>,
 }
 
@@ -258,8 +272,10 @@ struct ReadFileArguments {
     /// Remote path; relative paths and `~/` start at the login directory.
     path: String,
     /// First line to return, counted from 1. Default 1.
+    #[schemars(range(min = 1))]
     offset: Option<usize>,
     /// Most lines to return. Default 2000.
+    #[schemars(range(min = 1))]
     limit: Option<usize>,
 }
 
@@ -296,9 +312,9 @@ struct UploadArguments {
     connection: String,
     /// File or folder on this machine.
     local_path: String,
-    /// Full remote path to write, not the folder to put it in.
+    /// Full remote path to write, not the folder to put it in; its parent folder must exist.
     remote_path: String,
-    /// Replace what exists at remote_path; a folder is merged into.
+    /// Replace what exists at remote_path; a folder is merged into and keeps its permissions.
     overwrite: Option<bool>,
     /// Octal permissions for a single uploaded file, such as `0755`. Default: the local file's.
     mode: Option<String>,
@@ -313,7 +329,7 @@ struct DownloadArguments {
     remote_path: String,
     /// Full path to write on this machine; its parent folder must exist.
     local_path: String,
-    /// Replace what exists at local_path; a folder is merged into.
+    /// Replace what exists at local_path; a folder is merged into and keeps its permissions.
     overwrite: Option<bool>,
 }
 
@@ -511,13 +527,26 @@ impl SshServer {
             let jump = arguments
                 .via
                 .as_deref()
-                .map(|token| self.connection(token))
+                .map(|token| {
+                    self.connection(token)
+                        .map_err(|error| ToolError::new(format!("via: {}", error.message())))
+                })
                 .transpose()?;
             let host_key_fingerprints = match arguments.host_key_fingerprint {
                 None => Vec::new(),
                 Some(Fingerprints::One(fingerprint)) => vec![fingerprint],
                 Some(Fingerprints::Many(fingerprints)) => fingerprints,
             };
+            let connect_timeout = seconds(
+                "connect_timeout_seconds",
+                arguments.connect_timeout_seconds,
+                DEFAULT_CONNECT_TIMEOUT,
+            )?;
+            if connect_timeout.is_zero() {
+                return Err(ToolError::new(
+                    "connect_timeout_seconds must be more than 0",
+                ));
+            }
             let idle_timeout = match arguments.idle_timeout_seconds {
                 Some(0) => None,
                 Some(seconds) => Some(Duration::from_secs(seconds)),
@@ -539,15 +568,11 @@ impl SshServer {
                 via: jump.as_ref().map(ConnectionUse::shared),
                 allow_legacy_algorithms: arguments.allow_legacy_algorithms.unwrap_or(false),
                 idle_timeout,
-                connect_timeout: seconds(
-                    "connect_timeout_seconds",
-                    arguments.connect_timeout_seconds,
-                    DEFAULT_CONNECT_TIMEOUT,
-                )?,
+                connect_timeout,
             };
             tokio::select! {
                 result = crate::connection::connect(&self.registry, request) => result,
-                () = context.ct.cancelled() => Err(ToolError::new("The connect was cancelled.")),
+                () = context.ct.cancelled() => Err(ToolError::new("The connect was canceled.")),
             }
         }
         .await;
@@ -612,7 +637,7 @@ impl SshServer {
     }
 
     #[tool(
-        description = "Start a persistent shell in a terminal. A program that answers the POSIX shell setup (the login shell, sh, bash, zsh) is managed: shell_run reports exit codes, results say when it is back at its prompt, and pagers are set to cat. Other programs (fish, device CLIs, REPLs) and raw=true get a plain terminal, driven with shell_send and shell_read.",
+        description = "Start a persistent shell in a terminal. A program that answers the POSIX shell setup (the login shell, sh, bash, zsh) is managed: shell_run reports exit codes, results say when it is back at its prompt, pagers are set to cat, no history is saved, and history expansion and command and prompt hooks are off. Other programs (fish, device CLIs, REPLs) and raw=true get a plain terminal, driven with shell_send and shell_read.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -769,7 +794,7 @@ impl SshServer {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let result = async {
-            let (_connection, session) = self
+            let (connection, session) = self
                 .sftp_session(&arguments.connection, &context.ct)
                 .await?;
             let request = sftp::ReadRequest {
@@ -785,7 +810,7 @@ impl SshServer {
                     None => sftp::DEFAULT_READ_LINES,
                 },
             };
-            sftp::read_file(&session, request).await
+            sftp::read_file(&connection.sftp, &session, request, &context.ct).await
         }
         .await;
         finish(result)
@@ -805,10 +830,17 @@ impl SshServer {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let result = async {
-            let (_connection, session) = self
+            let (connection, session) = self
                 .sftp_session(&arguments.connection, &context.ct)
                 .await?;
-            sftp::write_file(&session, &arguments.path, &arguments.content).await
+            sftp::write_file(
+                &connection.sftp,
+                &session,
+                &arguments.path,
+                &arguments.content,
+                &context.ct,
+            )
+            .await
         }
         .await;
         finish(result)
@@ -828,7 +860,7 @@ impl SshServer {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let result = async {
-            let (_connection, session) = self
+            let (connection, session) = self
                 .sftp_session(&arguments.connection, &context.ct)
                 .await?;
             let request = sftp::EditRequest {
@@ -837,7 +869,7 @@ impl SshServer {
                 new_string: arguments.new_string,
                 replace_all: arguments.replace_all.unwrap_or(false),
             };
-            sftp::edit_file(&session, request).await
+            sftp::edit_file(&connection.sftp, &session, request, &context.ct).await
         }
         .await;
         finish(result)
@@ -922,6 +954,7 @@ impl SshServer {
     async fn forward_local(
         &self,
         Parameters(arguments): Parameters<ForwardLocalArguments>,
+        context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let result = async {
             let connection = self.connection(&arguments.connection)?;
@@ -932,6 +965,7 @@ impl SshServer {
                 arguments.remote_host,
                 arguments.remote_port,
                 arguments.local_port.unwrap_or(0),
+                &context.ct,
             )
             .await
         }
@@ -950,6 +984,7 @@ impl SshServer {
     async fn forward_remote(
         &self,
         Parameters(arguments): Parameters<ForwardRemoteArguments>,
+        context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let result = async {
             let connection = self.connection(&arguments.connection)?;
@@ -957,12 +992,15 @@ impl SshServer {
                 &connection.handle,
                 &connection.forwards,
                 &connection.remote_forward_targets,
-                arguments
-                    .remote_bind_address
-                    .unwrap_or_else(|| "localhost".to_owned()),
-                arguments.remote_port,
-                arguments.local_host,
-                arguments.local_port,
+                forward::RemoteForwardRequest {
+                    bind_address: arguments
+                        .remote_bind_address
+                        .unwrap_or_else(|| "localhost".to_owned()),
+                    port: arguments.remote_port,
+                    local_host: arguments.local_host,
+                    local_port: arguments.local_port,
+                },
+                &context.ct,
             )
             .await
         }
@@ -981,6 +1019,7 @@ impl SshServer {
     async fn forward_dynamic(
         &self,
         Parameters(arguments): Parameters<ForwardDynamicArguments>,
+        context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let result = async {
             let connection = self.connection(&arguments.connection)?;
@@ -989,6 +1028,7 @@ impl SshServer {
                 &connection.forwards,
                 &connection.closed,
                 arguments.local_port.unwrap_or(0),
+                &context.ct,
             )
             .await
         }
@@ -997,7 +1037,7 @@ impl SshServer {
     }
 
     #[tool(
-        description = "Stop a forward.",
+        description = "Stop a forward from taking new connections; connections already open through it go on until they close.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn forward_close(

@@ -43,6 +43,7 @@ download = "unrestricted"
 ## Timeouts and logs
 
 - meka cancels an MCP call after 10 minutes; `MEKA_MCP_TOOL_TIMEOUT` (such as `30m`) changes that.
-  A canceled shell call interrupts nothing, but a canceled `exec` stops its command.
+  A canceled shell call interrupts nothing, a canceled `exec` stops its command, and a canceled
+  file tool stops before its next change.
 - meka starts servers with a minimal environment. To debug, set `env = { RUST_LOG = "debug" }` in
   the server's entry.

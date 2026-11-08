@@ -25,9 +25,15 @@ const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 /// channel) before the next step.
 const STOP_GRACE: Duration = Duration::from_secs(2);
 
-/// How long output is still collected after the command exits. A process it started in the
-/// background can hold its output open, and the call must not wait for that process.
+/// How long output may pause after the command exits before the call returns. A process it
+/// started in the background can hold its output open, and the call must not wait for that
+/// process. Output that keeps coming keeps the call reading, up to [`EXIT_DRAIN_LIMIT`]: the server
+/// sends the exit status ahead of output it still holds, as it does on a slow link.
 const EXIT_DRAIN: Duration = Duration::from_secs(1);
+
+/// The longest the call reads output after the command exits, unless the timeout comes first. A
+/// background process that keeps printing holds the call this long.
+const EXIT_DRAIN_LIMIT: Duration = Duration::from_secs(10);
 
 /// One command to run.
 pub(crate) struct ExecRequest {
@@ -56,24 +62,29 @@ enum StopReason {
 /// Run `request` on a new channel of `handle` and describe the outcome.
 pub(crate) async fn run(
     handle: &SshHandle,
-    request: ExecRequest,
+    mut request: ExecRequest,
     cancel: &CancellationToken,
     progress: &mut Progress,
 ) -> Result<String, ToolError> {
     let mut channel = open_session_channel(handle, cancel).await?;
-    bounded(
+    if let Err(error) = bounded(
         REQUEST_TIMEOUT,
         "send the command",
         channel.exec(true, request.command.as_bytes()),
     )
-    .await?;
+    .await
+    {
+        best_effort(CLOSE_TIMEOUT, "closing the exec channel", channel.close()).await;
+        return Err(error);
+    }
 
     let started = Instant::now();
+    let timeout_at = tokio::time::Instant::from_std(started + request.timeout);
     // stdin is fed by its own task: a command that does not read it, or prints while it is fed,
     // must neither stop its output from being read nor keep the timeout from firing.
     let stdin_task = tokio::spawn({
         let mut writer = channel.make_writer();
-        let stdin = request.stdin.clone().unwrap_or_default();
+        let stdin = request.stdin.take().unwrap_or_default();
         async move {
             if let Err(error) = writer.write_all(stdin.as_bytes()).await {
                 tracing::debug!("stdin could not be sent: {error}");
@@ -83,7 +94,7 @@ pub(crate) async fn run(
             }
         }
     });
-    let mut next_step = tokio::time::Instant::from_std(started + request.timeout);
+    let mut next_step = timeout_at;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut exit = None;
@@ -97,24 +108,46 @@ pub(crate) async fn run(
     let mut progress_tick = tokio::time::interval(PROGRESS_INTERVAL);
     progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // The latest the call reads output after the command exits, set when it exits.
+    let mut drain_limit = timeout_at;
     loop {
         if exit.is_some() && drain_until.is_none() {
-            drain_until = Some(tokio::time::Instant::now() + EXIT_DRAIN);
+            let now = tokio::time::Instant::now();
+            drain_limit = (now + EXIT_DRAIN_LIMIT)
+                .min(timeout_at)
+                .max(now + EXIT_DRAIN);
+            drain_until = Some(now + EXIT_DRAIN);
         }
         tokio::select! {
             message = channel.wait() => match message {
                 Some(ChannelMsg::Data { data }) => {
                     let full = capture(&mut stdout, stderr.len(), &data);
+                    if full && exit.is_some() {
+                        left_output_open = true;
+                        best_effort(CLOSE_TIMEOUT, "closing the exec channel", channel.close()).await;
+                        break;
+                    }
                     if full && stop.is_none() {
                         stop = Some(StopReason::OutputLimit);
                         next_step = tokio::time::Instant::now();
                     }
+                    if exit.is_some() {
+                        drain_until = Some((tokio::time::Instant::now() + EXIT_DRAIN).min(drain_limit));
+                    }
                 }
                 Some(ChannelMsg::ExtendedData { data, .. }) => {
                     let full = capture(&mut stderr, stdout.len(), &data);
+                    if full && exit.is_some() {
+                        left_output_open = true;
+                        best_effort(CLOSE_TIMEOUT, "closing the exec channel", channel.close()).await;
+                        break;
+                    }
                     if full && stop.is_none() {
                         stop = Some(StopReason::OutputLimit);
                         next_step = tokio::time::Instant::now();
+                    }
+                    if exit.is_some() {
+                        drain_until = Some((tokio::time::Instant::now() + EXIT_DRAIN).min(drain_limit));
                     }
                 }
                 Some(ChannelMsg::ExitStatus { exit_status }) => exit = Some(Exit::Status(exit_status)),
@@ -124,7 +157,10 @@ pub(crate) async fn run(
                 Some(ChannelMsg::Success) => exec_confirmed = true,
                 Some(ChannelMsg::Failure) if !exec_confirmed => {
                     stdin_task.abort();
-                    return Err(ToolError::new("The server refused to run the command."));
+                    best_effort(CLOSE_TIMEOUT, "closing the exec channel", channel.close()).await;
+                    return Err(ToolError::new(
+                        "The server refused to run the command. It may allow only an interactive shell: try shell_open.",
+                    ));
                 }
                 Some(ChannelMsg::Close) | None => break,
                 Some(_) => {}
@@ -134,7 +170,8 @@ pub(crate) async fn run(
                 best_effort(CLOSE_TIMEOUT, "closing the exec channel", channel.close()).await;
                 break;
             }
-            () = tokio::time::sleep_until(next_step) => {
+            // Once the command has exited there is nothing left to stop; the drain ends the call.
+            () = tokio::time::sleep_until(next_step), if exit.is_none() => {
                 if stop.is_none() {
                     stop = Some(StopReason::TimedOut);
                 }
@@ -167,7 +204,13 @@ pub(crate) async fn run(
                 steps_taken += 1;
                 next_step = tokio::time::Instant::now() + STOP_GRACE;
             }
-            () = cancel.cancelled(), if stop.is_none() && exit.is_none() => {
+            // Before the exit a cancel starts the stop steps unless they have started; after it, a
+            // cancel ends the reading of what is left.
+            () = cancel.cancelled(), if exit.is_some() || stop.is_none() => {
+                if exit.is_some() {
+                    best_effort(CLOSE_TIMEOUT, "closing the exec channel", channel.close()).await;
+                    break;
+                }
                 stop = Some(StopReason::Canceled);
                 next_step = tokio::time::Instant::now();
             }

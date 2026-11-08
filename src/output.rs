@@ -117,6 +117,11 @@ pub(crate) fn last_output_line(output: &[u8]) -> Option<String> {
 /// tool looks for a new status line.
 pub(crate) const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long a progress notification may wait for the client to take it. The tool waits for it
+/// while it reads nothing from the server, and a client slow to read its input must not stall the
+/// SSH connection.
+const PROGRESS_SEND_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// Sends `notifications/progress` for one tool call when the caller asked for them with a progress
 /// token, at most once per [`PROGRESS_INTERVAL`]. The progress number is the bytes done for a
 /// transfer and the whole seconds since the call started otherwise, so it always increases.
@@ -181,8 +186,10 @@ impl Progress {
         if let Some(total) = total {
             parameters = parameters.with_total(total);
         }
-        if let Err(error) = peer.notify_progress(parameters).await {
-            tracing::debug!("progress notification was not delivered: {error}");
+        match tokio::time::timeout(PROGRESS_SEND_TIMEOUT, peer.notify_progress(parameters)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::debug!("progress notification was not delivered: {error}"),
+            Err(_) => tracing::debug!("the client did not take a progress notification in time"),
         }
     }
 }
@@ -196,7 +203,8 @@ pub(crate) fn format_size(bytes: u64) -> String {
     #[allow(clippy::cast_precision_loss)]
     let mut value = bytes as f64 / 1024.0;
     let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
+    // A value that rounds to 1024.0 is shown in the next unit.
+    while value >= 1023.95 && unit + 1 < UNITS.len() {
         value /= 1024.0;
         unit += 1;
     }
@@ -206,10 +214,11 @@ pub(crate) fn format_size(bytes: u64) -> String {
 /// Format a duration for a person: `0.4s`, `12.3s`, `4m 05s`.
 pub(crate) fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs_f64();
-    if seconds < 60.0 {
+    // A value that rounds to 60.0 is shown in minutes.
+    if seconds < 59.95 {
         return format!("{seconds:.1}s");
     }
-    let whole = duration.as_secs();
+    let whole = duration.as_secs().max(60);
     if whole < 3600 {
         format!("{}m {:02}s", whole / 60, whole % 60)
     } else {
@@ -227,7 +236,7 @@ pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
 }
 
 /// The smallest index no less than `index` that falls on a UTF-8 character boundary of `text`.
-fn ceil_char_boundary(text: &str, index: usize) -> usize {
+pub(crate) fn ceil_char_boundary(text: &str, index: usize) -> usize {
     let mut index = index.min(text.len());
     while !text.is_char_boundary(index) {
         index += 1;
@@ -238,18 +247,34 @@ fn ceil_char_boundary(text: &str, index: usize) -> usize {
 /// Decode `bytes` as UTF-8, replacing invalid sequences, and keep at most `limit` bytes of text:
 /// the start and the end, with a line in between saying how much was left out.
 pub(crate) fn decode_with_limit(bytes: &[u8], limit: usize) -> String {
-    let text = String::from_utf8_lossy(bytes);
-    if text.len() <= limit {
-        return text.into_owned();
-    }
-    let head_end = floor_char_boundary(&text, limit / 2);
-    let tail_start = ceil_char_boundary(&text, text.len() - (limit - limit / 2));
-    let omitted = tail_start - head_end;
+    // Only the ends that can be kept are decoded, with a few bytes to spare for a character cut at
+    // the edge, so a large capture is not decoded whole.
+    const SPARE_BYTES: usize = 4;
+    let (head, tail, total) = if bytes.len() > limit.saturating_add(2 * SPARE_BYTES) {
+        let head_bytes = bytes.get(..limit / 2 + SPARE_BYTES).unwrap_or_default();
+        let tail_from = bytes.len() - (limit - limit / 2) - SPARE_BYTES;
+        let tail_bytes = bytes.get(tail_from..).unwrap_or_default();
+        (
+            String::from_utf8_lossy(head_bytes),
+            String::from_utf8_lossy(tail_bytes),
+            bytes.len(),
+        )
+    } else {
+        let text = String::from_utf8_lossy(bytes);
+        if text.len() <= limit {
+            return text.into_owned();
+        }
+        let length = text.len();
+        (text.clone(), text, length)
+    };
+    let head = head
+        .get(..floor_char_boundary(&head, limit / 2))
+        .unwrap_or("");
+    let tail_start = ceil_char_boundary(&tail, tail.len().saturating_sub(limit - limit / 2));
+    let tail = tail.get(tail_start..).unwrap_or("");
     format!(
-        "{}\n[... {} omitted; raise max_output_bytes or redirect the output to a file ...]\n{}",
-        text.get(..head_end).unwrap_or(""),
-        format_size(omitted as u64),
-        text.get(tail_start..).unwrap_or("")
+        "{head}\n[... {} omitted; raise max_output_bytes or redirect the output to a file ...]\n{tail}",
+        format_size(total.saturating_sub(head.len() + tail.len()) as u64)
     )
 }
 
@@ -408,7 +433,9 @@ mod tests {
     fn sizes_and_durations_read_naturally() {
         assert_eq!(format_size(512), "512 B");
         assert_eq!(format_size(3 * 1024 * 1024 / 2), "1.5 MiB");
+        assert_eq!(format_size(1024 * 1024 - 1), "1.0 MiB");
         assert_eq!(format_duration(Duration::from_millis(400)), "0.4s");
+        assert_eq!(format_duration(Duration::from_millis(59_960)), "1m 00s");
         assert_eq!(format_duration(Duration::from_secs(245)), "4m 05s");
     }
 }

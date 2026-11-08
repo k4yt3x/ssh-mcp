@@ -2103,12 +2103,13 @@ dependencies = [
 
 [[package]]
 name = "ssh-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
  "getrandom 0.4.3",
  "hmac",
+ "libc",
  "pty-process",
  "regex",
  "rmcp",

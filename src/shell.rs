@@ -23,8 +23,9 @@ use crate::{
         CLOSE_TIMEOUT, REQUEST_TIMEOUT, SshHandle, best_effort, bounded, open_session_channel,
     },
     output::{
-        PROGRESS_INTERVAL, Progress, STATUS_TAIL_BYTES, ToolError, clean_terminal_text,
-        format_duration, format_size, last_output_line, lock, random_hex, signal_label,
+        PROGRESS_INTERVAL, Progress, STATUS_TAIL_BYTES, ToolError, ceil_char_boundary,
+        clean_terminal_text, floor_char_boundary, format_duration, format_size, last_output_line,
+        lock, random_hex, signal_label,
     },
 };
 
@@ -39,7 +40,7 @@ const SETTLE: Duration = Duration::from_millis(800);
 const LOGIN_SETTLE: Duration = Duration::from_millis(400);
 
 /// The most columns or rows a terminal may have; the rendered screen is allocated whole.
-const MAX_TERMINAL_SIDE: u16 = 1000;
+pub(crate) const MAX_TERMINAL_SIDE: u16 = 1000;
 
 /// How long `shell_open` waits for the login output to settle and for the shell to answer the
 /// managed-mode setup.
@@ -105,11 +106,10 @@ pub(crate) struct ShellTable {
 impl ShellTable {
     /// The shell numbered `number`.
     fn get(&self, number: u32) -> Result<Arc<Shell>, ToolError> {
-        self.shells.get(&number).cloned().ok_or_else(|| {
-            ToolError::new(format!(
-                "This connection has no shell {number}. Use connection_status to see its shells."
-            ))
-        })
+        self.shells
+            .get(&number)
+            .cloned()
+            .ok_or_else(|| no_such_shell(number))
     }
 
     /// One line per shell, for the connection status.
@@ -130,7 +130,9 @@ impl ShellTable {
                         first_line(&run.command),
                         format_duration(run.started.elapsed())
                     )
-                } else if state.mode == Mode::Managed && state.at_prompt {
+                } else if state.mode == Mode::Raw {
+                    "no prompt detection".to_owned()
+                } else if state.at_prompt {
                     "at the prompt".to_owned()
                 } else {
                     "busy".to_owned()
@@ -142,6 +144,12 @@ impl ShellTable {
             })
             .collect()
     }
+}
+
+fn no_such_shell(number: u32) -> ToolError {
+    ToolError::new(format!(
+        "This connection has no shell {number}. Use connection_status to see its shells."
+    ))
 }
 
 /// One persistent shell.
@@ -230,7 +238,7 @@ impl RunOutcome {
                 format_duration(*elapsed)
             ),
             Self::Interrupted { command, elapsed } => format!(
-                "`{}` was interrupted after {}; its exit code is unknown",
+                "`{}` ended without an exit code after {}: it was interrupted, or the shell could not parse it",
                 first_line(command),
                 format_duration(*elapsed)
             ),
@@ -350,7 +358,7 @@ impl ShellState {
         }
         if let Some(run) = &self.run {
             return Err(ToolError::new(format!(
-                "Shell {number} is still running `{}`. Use shell_read to wait for it, or shell_send with keys [\"ctrl+c\"] to interrupt it.",
+                "Shell {number} is still running `{}`. Use shell_read to wait for it, or shell_send to end it: keys [\"ctrl+c\"] stops a command, and a shell or REPL running in it takes its own exit command, such as `exit`.",
                 first_line(&run.command)
             )));
         }
@@ -408,8 +416,19 @@ impl ShellState {
             self.buffer.mark_reported();
             let screen = self.screen.screen();
             let (row, column) = screen.cursor_position();
-            let contents = screen.contents();
-            let contents = contents.trim_end_matches(['\n', ' ']);
+            let (_, width) = screen.size();
+            let wraps: Vec<bool> = (0..row)
+                .map(|earlier| screen.row_wrapped(earlier))
+                .collect();
+            // The cursor's place in the text, where a line wrapped across rows is one line.
+            let cursor_line = 1 + wraps.iter().filter(|wraps| !**wraps).count();
+            let continued_rows = wraps.iter().rev().take_while(|wraps| **wraps).count();
+            let cursor_column = continued_rows * usize::from(width.get()) + usize::from(column) + 1;
+            let rows = screen.rows(0, width.get()).enumerate().map(|(index, row)| {
+                let wraps = u16::try_from(index).is_ok_and(|index| screen.row_wrapped(index));
+                (row, wraps)
+            });
+            let (contents, note) = screen_text(rows, max_output_bytes);
             if dropped > 0 {
                 body.push_str(&format!(
                     "\n[{} of output was dropped]",
@@ -417,10 +436,12 @@ impl ShellState {
                 ));
             }
             body.push_str(&format!(
-                "\n--- screen (cursor at row {}, column {}; it replaces the output since the last result) ---\n{contents}",
-                row + 1,
-                column + 1
+                "\n--- screen (cursor at line {cursor_line}, column {cursor_column}; it replaces the output since the last result) ---\n{contents}"
             ));
+            if let Some(note) = note {
+                body.push('\n');
+                body.push_str(&note);
+            }
         } else {
             let (bytes, dropped, left) = self.buffer.take(max_output_bytes);
             remaining = left;
@@ -480,6 +501,68 @@ impl ShellState {
         }
         format!("[shell {number}: {}]{body}", lines.join("; "))
     }
+}
+
+/// The lines of a rendered screen as text: the rows a long line wrapped across are joined, the
+/// spaces that pad each line and the empty lines below the last one with text are left out, and
+/// no more lines are kept than fit in `max_bytes`, a first line longer than that being cut. Takes
+/// each row with whether it wraps onto the next, and returns the text and a note on what was left
+/// out.
+fn screen_text(
+    rows: impl Iterator<Item = (String, bool)>,
+    max_bytes: usize,
+) -> (String, Option<String>) {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for (row, wraps) in rows {
+        line.push_str(&row);
+        if !wraps {
+            lines.push(std::mem::take(&mut line).trim_end().to_owned());
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line.trim_end().to_owned());
+    }
+    let used = lines
+        .iter()
+        .rposition(|line| !line.is_empty())
+        .map_or(0, |last| last + 1);
+    let mut text = String::new();
+    let mut shown = 0;
+    let mut first_cut = false;
+    for line in lines.iter().take(used) {
+        let separator = usize::from(shown > 0);
+        if text.len() + separator + line.len() > max_bytes {
+            if shown == 0 {
+                text.push_str(
+                    line.get(..floor_char_boundary(line, max_bytes))
+                        .unwrap_or_default(),
+                );
+                shown = 1;
+                first_cut = true;
+            }
+            break;
+        }
+        if separator > 0 {
+            text.push('\n');
+        }
+        text.push_str(line);
+        shown += 1;
+    }
+    let left_out = match used - shown {
+        0 => None,
+        1 => Some("1 more line is left out".to_owned()),
+        lines => Some(format!("{lines} more lines are left out")),
+    };
+    let note = match (first_cut, left_out) {
+        (false, None) => None,
+        (true, None) => Some("[the line is cut to stay within max_output_bytes]".to_owned()),
+        (false, Some(left_out)) => Some(format!("[{left_out} to stay within max_output_bytes]")),
+        (true, Some(left_out)) => Some(format!(
+            "[the first line is cut, and {left_out}, to stay within max_output_bytes]"
+        )),
+    };
+    (text, note)
 }
 
 /// Where the bytes passed to the terminal emulator stand relative to an OSC string, which the
@@ -583,10 +666,19 @@ impl OutputBuffer {
         self.reported = self.reported.max(self.start);
         let mut bytes = self.since(self.reported);
         if bytes.len() > limit {
+            let first_character = bytes
+                .first()
+                .map_or(1, |first| utf8_sequence_length(*first))
+                .min(bytes.len());
             bytes.truncate(limit);
             match bytes.iter().rposition(|byte| *byte == b'\n') {
                 Some(newline) => bytes.truncate(newline + 1),
                 None => bytes.truncate(complete_utf8_prefix(&bytes)),
+            }
+            if bytes.is_empty() {
+                // A limit smaller than the first character still returns it, so reads advance.
+                bytes = self.since(self.reported);
+                bytes.truncate(first_character);
             }
         }
         self.reported += bytes.len() as u64;
@@ -607,12 +699,7 @@ fn complete_utf8_prefix(bytes: &[u8]) -> usize {
         if byte & 0xc0 == 0x80 {
             continue;
         }
-        let length = match byte {
-            0xf0..=0xf7 => 4,
-            0xe0..=0xef => 3,
-            0xc0..=0xdf => 2,
-            _ => 1,
-        };
+        let length = utf8_sequence_length(byte);
         return if index + length > bytes.len() {
             index
         } else {
@@ -620,6 +707,16 @@ fn complete_utf8_prefix(bytes: &[u8]) -> usize {
         };
     }
     bytes.len()
+}
+
+/// The length of the UTF-8 sequence `first` starts, or 1 for a byte that starts none.
+fn utf8_sequence_length(first: u8) -> usize {
+    match first {
+        0xf0..=0xf7 => 4,
+        0xe0..=0xef => 3,
+        0xc0..=0xdf => 2,
+        _ => 1,
+    }
 }
 
 /// A marker the shell printed.
@@ -716,17 +813,27 @@ fn marker_command(kind: &str, nonce: &str) -> String {
 }
 
 /// The setup line sent to a shell that should be managed. It is valid in every POSIX shell
-/// (shell-specific syntax goes through `eval`), and it turns off echo and line editing so input
-/// is not repeated in the output, sets the prompts to markers, and sets the pagers to `cat` so
-/// commands like `git log` and `systemctl status` do not stop in `less`.
+/// (shell-specific syntax goes through `eval`). It turns off echo and line editing so input is not
+/// repeated in the output, history expansion so a `!` in a command is not taken as a history
+/// reference, and the hooks bash and zsh run around each command and prompt (prompt themes and
+/// history recorders such as atuin would see every command's wrapper and its nonce, and a theme
+/// would overwrite the prompts). It sets the prompts to markers and the pagers to `cat`, so
+/// commands like `git log` and `systemctl status` do not stop in `less`, and unsets `HISTFILE` so
+/// the shell saves no history.
+///
+/// The `unset` comes last because a server that makes `HISTFILE` read-only makes it fail, and zsh,
+/// dash and ash then drop the rest of the line. The line starts with a space for zsh set to write
+/// each line to its history file as it is entered, which happens before the line runs: when zsh
+/// also ignores lines that start with a space (oh-my-zsh sets both), it leaves this line out.
 fn setup_line(nonce: &str) -> String {
     format!(
-        "stty -echo 2>/dev/null; \
-         if [ -n \"$BASH_VERSION\" ]; then set +o emacs +o vi; unset PROMPT_COMMAND PS0; fi; \
-         if [ -n \"$ZSH_VERSION\" ]; then eval 'unsetopt zle prompt_cr prompt_sp; precmd_functions=(); RPROMPT=\"\"'; fi; \
+        " stty -echo 2>/dev/null; \
+         if [ -n \"$BASH_VERSION\" ]; then set +o emacs +o vi; set +H; trap - DEBUG; unset PROMPT_COMMAND PS0; fi; \
+         if [ -n \"$ZSH_VERSION\" ]; then eval 'unsetopt zle prompt_cr prompt_sp bang_hist; precmd_functions=(); preexec_functions=(); zshaddhistory_functions=(); RPROMPT=\"\"; unfunction precmd preexec zshaddhistory 2>/dev/null'; fi; \
          PS1=\"$({prompt})\"; \
          PS2=\"$({continuation})\"; \
-         export PAGER=cat GIT_PAGER=cat SYSTEMD_PAGER=cat\n",
+         export PAGER=cat GIT_PAGER=cat SYSTEMD_PAGER=cat; \
+         unset HISTFILE 2>/dev/null\n",
         prompt = marker_command("P", nonce),
         continuation = marker_command("C", nonce),
     )
@@ -838,6 +945,10 @@ impl Shell {
         F: FnMut(&ShellState) -> Option<Option<Instant>>,
     {
         loop {
+            // A canceled call must not go on to consume output or outcomes.
+            if cancel.is_cancelled() {
+                return WaitEnd::Canceled;
+            }
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -856,13 +967,14 @@ impl Shell {
                 wake = wake.min(at);
             }
             tokio::select! {
+                biased;
+                () = cancel.cancelled() => return WaitEnd::Canceled,
                 () = &mut notified => {}
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {
                     if Instant::now() >= deadline {
                         return WaitEnd::TimedOut;
                     }
                 }
-                () = cancel.cancelled() => return WaitEnd::Canceled,
             }
         }
     }
@@ -1127,8 +1239,20 @@ pub(crate) async fn open(
             .write(setup_line(&shell.nonce).as_bytes(), Some(cancel))
             .await
         {
+            let exited = shell.lock().closed.clone();
             abandon(table, &shell).await;
-            return Err(error);
+            if cancel.is_cancelled() {
+                return Err(ToolError::new(canceled));
+            }
+            return Err(ToolError::new(match exited {
+                Some(exited) => {
+                    format!("The shell exited during the managed-mode setup ({exited}).")
+                }
+                None => format!(
+                    "The managed-mode setup could not be typed into the shell ({}), so it was closed. Open it with raw: true to drive it with shell_send.",
+                    error.message()
+                ),
+            }));
         }
         let answered = shell
             .wait(Instant::now() + OPEN_WAIT, cancel, &mut progress, |state| {
@@ -1158,13 +1282,27 @@ pub(crate) async fn open(
         if let Some(login_output) = login_output {
             let login_text = clean_terminal_text(&login_output);
             let login_text = login_text.trim();
+            // The end of a long login output is kept: it is what led to the prompt.
+            let kept_from = ceil_char_boundary(
+                login_text,
+                login_text.len().saturating_sub(UNREQUESTED_OUTPUT_BYTES),
+            );
+            let left_out = if kept_from > 0 {
+                format!(
+                    "[{} of earlier login output left out]\n",
+                    format_size(kept_from as u64)
+                )
+            } else {
+                String::new()
+            };
+            let login_text = format!("{left_out}{}", login_text.get(kept_from..).unwrap_or(""));
             let mut text = format!(
                 "[shell {}: opened in managed mode; shell_run reports exit codes; at the prompt]",
                 shell.number
             );
             if !login_text.is_empty() {
                 text.push_str("\n--- login output ---\n");
-                text.push_str(login_text);
+                text.push_str(&login_text);
             }
             return Ok(text);
         }
@@ -1175,7 +1313,9 @@ pub(crate) async fn open(
     }
     let opened_note = match note {
         Some(note) => format!("opened; {note}"),
-        None => "opened in raw mode".to_owned(),
+        None if request.raw => "opened in raw mode".to_owned(),
+        // The shell exited before the setup could be sent; the result says so.
+        None => "opened".to_owned(),
     };
     let text = shell.report(View::Auto, UNREQUESTED_OUTPUT_BYTES, Some(opened_note));
     forget_if_reported(table, &shell);
@@ -1261,12 +1401,13 @@ pub(crate) async fn run(
                 }
             }
             WaitEnd::TimedOut => break,
-            WaitEnd::Canceled => {
-                return Err(ToolError::new(
-                    "The call was canceled. Nothing was interrupted: the command's output and outcome wait for shell_read.",
-                ));
-            }
+            WaitEnd::Canceled => break,
         }
+    }
+    if cancel.is_cancelled() {
+        return Err(ToolError::new(
+            "The call was canceled. Nothing was interrupted: the command's output and outcome wait for shell_read.",
+        ));
     }
     let text = shell.report(View::Auto, request.max_output_bytes, None);
     forget_if_reported(table, &shell);
@@ -1359,7 +1500,7 @@ pub(crate) async fn send(
             }
         })
         .await;
-    if matches!(end, WaitEnd::Canceled) {
+    if matches!(end, WaitEnd::Canceled) || cancel.is_cancelled() {
         return Err(ToolError::new(
             "The call was canceled after the input was sent; the output waits for shell_read.",
         ));
@@ -1435,26 +1576,52 @@ pub(crate) async fn read(
             })
             .await;
         if matches!(end, WaitEnd::Canceled) {
-            return Err(ToolError::new(
-                "The call was canceled; the output waits for the next shell_read.",
-            ));
+            return Err(read_canceled());
         }
     }
+    if cancel.is_cancelled() {
+        return Err(read_canceled());
+    }
     shell.cancel_if_incomplete().await?;
+    if cancel.is_cancelled() {
+        return Err(read_canceled());
+    }
     let text = shell.report(request.view, request.max_output_bytes, None);
     forget_if_reported(table, &shell);
     Ok(text)
 }
 
-/// Close a shell, reporting the output nobody has read.
+fn read_canceled() -> ToolError {
+    ToolError::new("The call was canceled; the output waits for the next shell_read.")
+}
+
+/// Close a shell, reporting the outcomes and output nobody has read.
 pub(crate) async fn close(table: &Mutex<ShellTable>, number: u32) -> Result<String, ToolError> {
     let shell = lock(table)
         .shells
         .remove(&number)
-        .ok_or_else(|| ToolError::new(format!("This connection has no shell {number}.")))?;
-    let (bytes, dropped, remaining) = shell.lock().buffer.take(UNREQUESTED_OUTPUT_BYTES);
+        .ok_or_else(|| no_such_shell(number))?;
+    let (bytes, dropped, remaining, mut status) = {
+        let mut state = shell.lock();
+        let (bytes, dropped, remaining) = state.buffer.take(UNREQUESTED_OUTPUT_BYTES);
+        let mut status: Vec<String> = state
+            .finished
+            .drain(..)
+            .map(|outcome| outcome.describe())
+            .collect();
+        if let Some(run) = &state.run {
+            let ending = if state.closed.is_some() {
+                "did not finish before the shell exited"
+            } else {
+                "was still running and was hung up"
+            };
+            status.push(format!("`{}` {ending}", first_line(&run.command)));
+        }
+        (bytes, dropped, remaining, status)
+    };
     best_effort(CLOSE_TIMEOUT, "closing the shell", shell.writer.close()).await;
-    let mut text = format!("[shell {number}: closed]");
+    status.push("closed".to_owned());
+    let mut text = format!("[shell {number}: {}]", status.join("; "));
     if dropped > 0 {
         text.push_str(&format!(
             "\n[{} of earlier output was dropped before it was read]",
@@ -1786,7 +1953,10 @@ mod tests {
         state.ingest(b"^C\r\n", NONCE);
         state.ingest(&marker("P", ""), NONCE);
         let report = state.report(1, View::Stream, 1024, None);
-        assert!(report.contains("`sleep 100` was interrupted"), "{report}");
+        assert!(
+            report.contains("`sleep 100` ended without an exit code"),
+            "{report}"
+        );
         assert!(report.contains("at the prompt"), "{report}");
     }
 
@@ -1895,6 +2065,57 @@ mod tests {
         let contents = state.screen.screen().contents();
         assert!(contents.contains("visible"), "{contents}");
         assert!(!contents.contains("xxx"), "{contents}");
+    }
+
+    #[test]
+    fn a_screen_has_no_padding_and_stays_within_max_output_bytes() {
+        let mut state = state();
+        let mut painted = b"\x1b[?1049h".to_vec();
+        for row in 1..=40 {
+            painted.extend(format!("\x1b[{row};1Hrow {row:02}{}", " ".repeat(30)).into_bytes());
+        }
+        state.ingest(&painted, NONCE);
+        let report = state.report(1, View::Screen, 100, None);
+        let (_, screen) = report.split_once(") ---\n").unwrap();
+        let rows: Vec<&str> = screen
+            .lines()
+            .filter(|line| line.starts_with("row "))
+            .collect();
+        assert_eq!(rows.first(), Some(&"row 01"), "{report}");
+        assert!(rows.iter().all(|row| !row.ends_with(' ')), "{report:?}");
+        assert!(
+            rows.iter().map(|row| row.len() + 1).sum::<usize>() <= 100,
+            "{report}"
+        );
+        assert!(rows.len() < 40, "{report}");
+    }
+
+    #[test]
+    fn a_line_wrapped_across_rows_is_one_line_and_a_cut_is_noted() {
+        let mut wrapped = state();
+        let long = "x".repeat(60);
+        wrapped.ingest(format!("{long}\r\nshort\r\n").as_bytes(), NONCE);
+        let report = wrapped.report(1, View::Screen, 1024, None);
+        assert!(report.contains(&format!("\n{long}\nshort")), "{report}");
+        assert!(report.contains("cursor at line 3, column 1;"), "{report}");
+        let report = wrapped.report(1, View::Screen, 10, None);
+        assert!(report.contains("\nxxxxxxxxxx\n"), "{report}");
+        assert!(
+            report.contains("the first line is cut, and 1 more line is left out"),
+            "{report}"
+        );
+        let mut unfinished = state();
+        unfinished.ingest("y".repeat(50).as_bytes(), NONCE);
+        let report = unfinished.report(1, View::Screen, 1024, None);
+        assert!(report.contains("cursor at line 1, column 51;"), "{report}");
+    }
+
+    #[test]
+    fn a_limit_smaller_than_a_character_still_advances() {
+        let mut buffer = OutputBuffer::new();
+        buffer.append("€uro".as_bytes());
+        assert_eq!(buffer.take(1).0, "€".as_bytes());
+        assert_eq!(buffer.take(1).0, b"u");
     }
 
     #[test]
